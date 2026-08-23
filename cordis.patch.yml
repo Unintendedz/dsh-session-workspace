@@ -1,0 +1,4 @@
+# Mount the host RPC and browser workspace picker into a DSH web profile.
+- insert:
+    - id: dsh-session-workspace
+      name: dsh-session-workspace
