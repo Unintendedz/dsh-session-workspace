@@ -1,7 +1,7 @@
-import { moveSessionWorkspace, WorkspaceMoveError } from './migration.js'
+import { moveSessionWorkspace, supportsNativeWorkspaceMove, WorkspaceMoveError } from './migration.js'
 
 export const name = 'dsh-session-workspace'
-export const inject = ['connection', 'agents', 'sessions', 'sessionPersistence', 'workspaceRegistry']
+export const inject = ['connection', 'webServer', 'agents', 'sessions', 'sessionPersistence', 'workspaceRegistry']
 
 function assertStatePayload(payload) {
   if (payload === null || typeof payload !== 'object' || Array.isArray(payload)
@@ -16,7 +16,7 @@ export async function sessionWorkspaceState(ctx, payload) {
   const { sessionId } = payload
   const live = ctx.sessions.get(sessionId)
   const header = live?.header
-    ?? (await ctx.sessionPersistence.list()).find(candidate => candidate.id === sessionId)
+    ?? (await ctx.sessionPersistence.list()).map(row => row.header ?? row).find(candidate => candidate.id === sessionId)
   if (header === undefined) {
     throw new WorkspaceMoveError('session-not-found', `session ${JSON.stringify(sessionId)} was not found`)
   }
@@ -27,8 +27,8 @@ export async function sessionWorkspaceState(ctx, payload) {
     currentWorkspaceId: current?.id,
     currentPath: header.cwd,
     active: live !== undefined || ctx.agents.get(sessionId) !== undefined,
-    supported: ctx.sessionPersistence.supportsRawArtifacts
-      && typeof ctx.sessionPersistence.readRaw === 'function'
+    supported: (supportsNativeWorkspaceMove(ctx.sessionPersistence)
+      || (ctx.sessionPersistence.supportsRawArtifacts && typeof ctx.sessionPersistence.readRaw === 'function'))
       && typeof ctx.workspaceRegistry.replaceHeaderIndex === 'function',
     workspaces: workspaces.map(workspace => ({
       workspaceId: workspace.id,
@@ -64,11 +64,9 @@ export function createRpcHandler(ctx) {
 
 export function apply(ctx) {
   ctx.effect(
-    () => ctx.connection.rpc.handle(
-      '/dsh-session-workspace',
-      createRpcHandler(ctx),
-      { authority: 'trusted-host' },
-    ),
+    () => typeof ctx.connection.register === 'function'
+      ? ctx.connection.register(ctx, '/dsh-session-workspace', createRpcHandler(ctx))
+      : ctx.connection.rpc.handle('/dsh-session-workspace', createRpcHandler(ctx), { authority: 'trusted-host' }),
     'dsh-session-workspace: rpc',
   )
 }

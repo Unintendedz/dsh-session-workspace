@@ -1,11 +1,12 @@
 import { randomUUID as nodeRandomUUID } from 'node:crypto'
 import { constants as fsConstants } from 'node:fs'
-import { copyFile, mkdir, open, rename, stat, unlink } from 'node:fs/promises'
-import { dirname, isAbsolute, join } from 'node:path'
+import { copyFile, link, mkdir, open, readFile, readdir, rename, stat, unlink } from 'node:fs/promises'
+import { basename, dirname, isAbsolute, join } from 'node:path'
 import { promisify } from 'node:util'
-import { constants as zlibConstants, zstdCompress } from 'node:zlib'
+import { constants as zlibConstants, zstdCompress, zstdDecompress } from 'node:zlib'
 
 const zstdCompressAsync = promisify(zstdCompress)
+const zstdDecompressAsync = promisify(zstdDecompress)
 const checksumOptions = {
   params: { [zlibConstants.ZSTD_c_checksumFlag]: 1 },
 }
@@ -145,7 +146,159 @@ async function refreshWorkspaceHeaders(ctx) {
   if (typeof refresh !== 'function') {
     fail('unsupported-dsh-version', 'this DSH build does not expose the workspace header refresh used by the plugin')
   }
-  await refresh.call(ctx.workspaceRegistry, await ctx.sessionPersistence.list())
+  const snapshots = await ctx.sessionPersistence.list()
+  await refresh.call(ctx.workspaceRegistry, snapshots.map(row => row.header ?? row))
+}
+
+export function supportsNativeWorkspaceMove(persistence) {
+  return persistence.generationFormat?.currentVersion === 3
+    && typeof persistence.generationFormat.createRestore === 'function'
+    && typeof persistence.open === 'function'
+    && typeof persistence.locate === 'function'
+    && typeof persistence.acquireWriteLease === 'function'
+}
+
+async function generationFiles(directory) {
+  try {
+    return (await readdir(directory)).filter(name => /^session(?:\.v\d+)?\.jsonl(?:\.zstd)?$/.test(name)).sort()
+  } catch (error) {
+    if (error?.code === 'ENOENT') return []
+    throw error
+  }
+}
+
+async function decodeArtifact(raw, path) {
+  if (!path.endsWith('.zstd')) return raw.toString('utf8')
+  const chunks = []
+  let offset = 0
+  while (offset < raw.length) {
+    // Node's one-shot decoder stops after one frame; DSH appends many frames.
+    const decoded = await zstdDecompressAsync(raw.subarray(offset), { info: true })
+    const consumed = decoded.engine.bytesWritten
+    if (!Number.isSafeInteger(consumed) || consumed <= 0 || consumed > raw.length - offset) {
+      fail('invalid-artifact', 'the compressed session frame did not decode completely')
+    }
+    chunks.push(decoded.buffer)
+    offset += consumed
+  }
+  return Buffer.concat(chunks).toString('utf8')
+}
+
+/** DSH 0.1.5 JSONL move, holding native ownership at both physical locations. */
+async function moveNativeSession(ctx, sessionId, target, workspaces, originalWorkspaceIds, options) {
+  const persistence = ctx.sessionPersistence
+  let handle, destinationLease, temporary
+  const moved = []
+  let destination, published = false, sourceDirectory
+  try {
+    try {
+      handle = await persistence.open(sessionId, 'write')
+    } catch (error) {
+      if (error?.name === 'SessionAlreadyOwnedError') fail('session-active', error.message)
+      throw error
+    }
+    const header = handle.header
+    if (header.id !== sessionId) fail('invalid-artifact', 'the stored session id does not match the requested id')
+    const sourceLocation = persistence.locate(header)
+    if (sourceLocation?.kind !== 'jsonl' || typeof sourceLocation.path !== 'string') {
+      fail('unsupported-persistence', 'session workspace moves require the JSONL persistence backend')
+    }
+    const source = sourceLocation.path
+    sourceDirectory = dirname(source)
+    const names = await generationFiles(sourceDirectory)
+    const revisions = new Map()
+    for (const name of names) revisions.set(name, await stat(join(sourceDirectory, name), { bigint: true }))
+    const raw = await readFile(source)
+    const content = await decodeArtifact(raw, source)
+    const rewritten = rewriteRawArtifact(content, target.path)
+    if (rewritten.meta.id !== sessionId || JSON.parse(content.slice(0, newlineAt(content))).cwd !== header.cwd) {
+      fail('source-changed', 'the stored header changed while preparing the move')
+    }
+    // Validate the complete current artifact through the host's own catalog.
+    if (!rewritten.content.endsWith('\n')) fail('invalid-artifact', 'the session artifact has an incomplete final line')
+    const lines = rewritten.content.trimEnd().split('\n')
+    const restore = persistence.generationFormat.createRestore(JSON.parse(lines.shift()))
+    for (const line of lines) restore.decodeRow(JSON.parse(line))
+    restore.finish()
+    const destinationLocation = persistence.locate({ ...header, cwd: target.path })
+    if (destinationLocation?.kind !== 'jsonl' || typeof destinationLocation.path !== 'string') {
+      fail('unsupported-persistence', 'the target session artifact cannot be located')
+    }
+    destination = destinationLocation.path
+    if (source === destination) fail('same-workspace', 'the target workspace resolves to the current session location')
+    const assertDestinationEmpty = async () => {
+      if ((await generationFiles(dirname(destination))).length > 0) {
+        fail('destination-exists', 'refusing to overwrite an existing destination session generation')
+      }
+    }
+    await assertDestinationEmpty()
+    destinationLease = await persistence.acquireWriteLease({ ...header, cwd: target.path })
+    await assertDestinationEmpty()
+    const jobId = (options.randomUUID ?? nodeRandomUUID)()
+    const backupDirectory = join(options.backupRoot ?? defaultBackupRoot(source), jobId)
+    await mkdir(backupDirectory, { recursive: true, mode: 0o700 })
+    for (const name of names) {
+      const backup = join(backupDirectory, name)
+      await copyFile(join(sourceDirectory, name), backup, fsConstants.COPYFILE_EXCL)
+      await syncFile(backup)
+    }
+    await syncDirectory(backupDirectory)
+    temporary = join(dirname(destination), `.session-workspace-${jobId}.tmp`)
+    await syncedWrite(temporary, await encodeRawArtifact(rewritten.content, destination))
+    const currentNames = await generationFiles(sourceDirectory)
+    if (JSON.stringify(currentNames) !== JSON.stringify(names)) fail('source-changed', 'session generations changed while preparing the move')
+    for (const name of names) {
+      if (!sameRevision(revisions.get(name), await stat(join(sourceDirectory, name), { bigint: true }))) {
+        fail('source-changed', 'a session generation changed while preparing the move')
+      }
+    }
+    if (ctx.sessions.get(sessionId) !== undefined || ctx.agents.get(sessionId) !== undefined) {
+      fail('session-active', 'the session became active while preparing the move')
+    }
+    try {
+      for (const name of names) {
+        const original = join(sourceDirectory, name)
+        const tombstone = join(sourceDirectory, `.dsh-moving-${jobId}-${name}`)
+        await rename(original, tombstone)
+        moved.push({ original, tombstone })
+      }
+      // link() refuses a concurrent destination instead of replacing it.
+      await link(temporary, destination)
+      published = true
+      await removeIfPresent(temporary)
+      temporary = undefined
+      await syncDirectory(sourceDirectory)
+      await syncDirectory(dirname(destination))
+      await refreshWorkspaceHeaders(ctx)
+      for (const workspace of workspaces) {
+        if (workspace.id !== target.id) await workspace.detachSession(sessionId)
+      }
+      await target.attachSession(sessionId)
+    } catch (error) {
+      const failures = [error]
+      try {
+        if (published) await removeIfPresent(destination)
+        for (const item of moved.toReversed()) await rename(item.tombstone, item.original)
+        await syncDirectory(sourceDirectory)
+        await syncDirectory(dirname(destination))
+      } catch (rollbackError) { failures.push(rollbackError) }
+      try {
+        await refreshWorkspaceHeaders(ctx)
+        await restoreWorkspaceAccounts(ctx, sessionId, originalWorkspaceIds)
+      } catch (rollbackError) { failures.push(rollbackError) }
+      if (failures.length > 1) throw new AggregateError(failures, `session move failed and rollback was incomplete: ${String(error)}`)
+      throw error
+    }
+    for (const item of moved) await removeIfPresent(item.tombstone)
+    await syncDirectory(sourceDirectory)
+    return { sessionId, workspaceId: target.id, path: target.path, backupPath: join(backupDirectory, basename(source)) }
+  } finally {
+    try {
+      if (temporary !== undefined) await removeIfPresent(temporary)
+    } finally {
+      try { await handle?.close() } finally { await destinationLease?.release() }
+    }
+  }
 }
 
 async function restoreWorkspaceAccounts(ctx, sessionId, originalWorkspaceIds) {
@@ -182,16 +335,19 @@ export async function moveSessionWorkspace(ctx, payload, options = {}) {
     if (typeof ctx.workspaceRegistry.replaceHeaderIndex !== 'function') {
       fail('unsupported-dsh-version', 'this DSH build does not expose the workspace header refresh used by the plugin')
     }
-    if (!ctx.sessionPersistence.supportsRawArtifacts || typeof ctx.sessionPersistence.readRaw !== 'function') {
-      fail('unsupported-persistence', 'session workspace moves require per-session JSONL artifacts')
-    }
-
     const workspaces = ctx.workspaceRegistry.list()
     const originalWorkspaceIds = workspaces
       .filter(workspace => workspace.sessionIds.includes(sessionId))
       .map(workspace => workspace.id)
     if (originalWorkspaceIds.includes(target.id)) {
       fail('same-workspace', `session ${JSON.stringify(sessionId)} already belongs to ${JSON.stringify(target.title)}`)
+    }
+
+    if (supportsNativeWorkspaceMove(ctx.sessionPersistence)) {
+      return await moveNativeSession(ctx, sessionId, target, workspaces, originalWorkspaceIds, options)
+    }
+    if (!ctx.sessionPersistence.supportsRawArtifacts || typeof ctx.sessionPersistence.readRaw !== 'function') {
+      fail('unsupported-persistence', 'session workspace moves require per-session JSONL artifacts')
     }
 
     const inspection = await ctx.sessionPersistence.load(sessionId)
