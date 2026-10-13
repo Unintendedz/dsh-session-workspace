@@ -6,6 +6,7 @@ await build({
   outfile: 'lib/client.js',
   absWorkingDir: fileURLToPath(new URL('..', import.meta.url)),
   bundle: true,
+  external: ['react'],
   format: 'cjs',
   platform: 'browser',
   target: 'es2022',

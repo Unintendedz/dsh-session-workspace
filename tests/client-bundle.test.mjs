@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import React from 'react'
 import { readFile } from 'node:fs/promises'
 import test from 'node:test'
 
@@ -18,10 +19,11 @@ test('published browser entry registers its factory with the DSH ModuleLoader', 
     assert.ok(handoff, 'published client entry must register through window.__ModuleLoader__.load')
     assert.equal(handoff.id, 'dsh-session-workspace')
     const exports = handoff.factory((specifier) => {
+      if (specifier === 'react') return React
       throw new Error(`unexpected browser external: ${specifier}`)
     })
     assert.equal(typeof exports.apply, 'function')
-    assert.deepEqual(Array.from(exports.inject), ['locale', 'connection'])
+    assert.deepEqual(Array.from(exports.inject), ['locale', 'connection', 'slots'])
   } finally {
     if (previousWindow === undefined) delete globalThis.window
     else globalThis.window = previousWindow

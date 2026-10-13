@@ -17,16 +17,20 @@ async function fixture({ compression = 'none', failAttach = false } = {}) {
   const nativeImport = name => import(pathToFileURL(`${process.env.DSH_NATIVE_ROOT}/node_modules/@deepseek-ai/${name}/lib/index.js`))
   const { Context } = await nativeImport('cordis')
   const { default: Persistence } = await nativeImport('dsh-session-persistence-jsonl')
-  const { Session } = await nativeImport('dsh-session')
+  const { Session, SESSION_FORMAT_VERSION } = await nativeImport('dsh-session')
   const owner = new Context()
   const peer = new Context()
   new Persistence(owner, { root: join(root, 'sessions'), compression })
   new Persistence(peer, { root: join(root, 'sessions'), compression })
   const id = 'synthetic-session'
-  const session = Session.create(id, [], { id, version: 3, createdAt: 1, isSeeded: false, delegationDepth: 0, cwd: oldPath })
+  const session = Session.create(id, [], { id, version: SESSION_FORMAT_VERSION, createdAt: 1, isSeeded: false, delegationDepth: 0, cwd: oldPath })
   session.append('session/title', { title: 'Synthetic title', messageSeqs: [], source: { kind: 'user' } })
+  session.append('user/message', { id: 'message-native', role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: '完整历史 🧪\nsecond line' }] }, { surfaceOp: 'append' })
   const stored = await owner.sessionPersistence.create(session.header)
-  await stored.append([...session.snapshotEvents(), { type: 'workspace-test/metadata', seq: session.seq, time: 10, data: { text: 'Preserve this payload' }, ignorable: true }]); await stored.close()
+  const expectedEvents = [...session.snapshotEvents(), { type: 'workspace-test/metadata', seq: session.seq, time: 10, data: { text: 'Preserve this payload' }, ignorable: true }]
+  await stored.append(expectedEvents.slice(0, 2))
+  await stored.append(expectedEvents.slice(2))
+  await stored.close()
   const source = owner.sessionPersistence.locate(session.header).path
   const sourceBytes = await readFile(source)
   const oldGeneration = join(dirname(source), compression === 'zstd' ? 'session.jsonl.zstd' : 'session.jsonl')
@@ -54,7 +58,7 @@ async function fixture({ compression = 'none', failAttach = false } = {}) {
     },
   }
   return {
-    root, id, source, sourceBytes, oldGeneration, oldBytes, oldPath, newPath, ctx, peer, oldIds, newIds,
+    root, id, source, sourceBytes, oldGeneration, oldBytes, oldPath, newPath, ctx, peer, oldIds, newIds, expectedEvents,
     async dispose() { await peer.fiber.dispose(); await owner.fiber.dispose(); await rm(root, { recursive: true, force: true }) },
   }
 }
@@ -79,7 +83,8 @@ for (const compression of ['none', 'zstd']) test(`moving native ${compression} s
     assert.deepEqual(await readFile(join(dirname(result.backupPath), basename(f.oldGeneration))), f.oldBytes)
     const reopened = await f.peer.sessionPersistence.open(f.id, 'read')
     assert.equal(reopened.header.cwd, f.newPath)
-    assert.equal((await reopened.read()).events.find(e => e.type === 'workspace-test/metadata').data.text, 'Preserve this payload')
+    assert.equal(reopened.header.id, f.id)
+    assert.deepEqual((await reopened.read()).events, f.expectedEvents)
     await reopened.close()
     assert.deepEqual(f.oldIds, [])
     assert.deepEqual(f.newIds, [f.id])

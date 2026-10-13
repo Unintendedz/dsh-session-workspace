@@ -28,7 +28,7 @@ export async function sessionWorkspaceState(ctx, payload) {
     currentPath: header.cwd,
     active: live !== undefined || ctx.agents.get(sessionId) !== undefined,
     supported: (supportsNativeWorkspaceMove(ctx.sessionPersistence)
-      || (ctx.sessionPersistence.supportsRawArtifacts && typeof ctx.sessionPersistence.readRaw === 'function'))
+      || (ctx.sessionPersistence.supportsRawArtifacts === true && typeof ctx.sessionPersistence.readRaw === 'function'))
       && typeof ctx.workspaceRegistry.replaceHeaderIndex === 'function',
     workspaces: workspaces.map(workspace => ({
       workspaceId: workspace.id,

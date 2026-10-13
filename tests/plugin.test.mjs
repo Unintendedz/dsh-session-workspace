@@ -78,16 +78,12 @@ test('workspaceDialogModel excludes the current workspace and gates active sessi
   })
 })
 
-test('sessionIdFromElement follows the owning React fiber without reading row text', () => {
-  const element = {
-    '__reactFiber$test': {
-      memoizedProps: {},
-      return: {
-        memoizedProps: { node: { id: 'session-one' } },
-        return: null,
-      },
-    },
+test('sessionIdFromElement reads the public session row key instead of React internals', () => {
+  const row = {
+    getAttribute: name => name === 'data-row-key' ? 'session:session-one' : null,
   }
-  assert.equal(sessionIdFromElement(element), 'session-one')
+  const child = { closest: selector => selector === '[data-row-key^="session:"]' ? row : null }
+  assert.equal(sessionIdFromElement(child), 'session-one')
+  assert.equal(sessionIdFromElement({ dataset: { rowKey: 'workspace:workspace-one' } }), undefined)
   assert.equal(sessionIdFromElement({}), undefined)
 })

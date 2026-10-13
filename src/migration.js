@@ -151,11 +151,30 @@ async function refreshWorkspaceHeaders(ctx) {
 }
 
 export function supportsNativeWorkspaceMove(persistence) {
-  return persistence.generationFormat?.currentVersion === 3
-    && typeof persistence.generationFormat.createRestore === 'function'
+  const format = persistence.generationFormat
+  return (format?.currentVersion === 3 && typeof format.createRestore === 'function'
+      || format?.currentVersion === 4)
     && typeof persistence.open === 'function'
     && typeof persistence.locate === 'function'
     && typeof persistence.acquireWriteLease === 'function'
+}
+
+async function validateCurrentArtifact(persistence, content) {
+  const lines = content.trimEnd().split('\n')
+  const header = JSON.parse(lines.shift())
+  let restore
+  if (persistence.generationFormat.currentVersion === 3) {
+    restore = persistence.generationFormat.createRestore(header)
+  } else {
+    // DSH 0.2 keeps the decoder in the first-party catalog, not on persistence.
+    const { sessionFormatCatalog } = await import('@deepseek-ai/dsh-session-format-catalog')
+    if (sessionFormatCatalog.currentVersion !== 4) {
+      fail('unsupported-dsh-version', 'the installed Session catalog does not match the V4 persistence backend')
+    }
+    restore = sessionFormatCatalog.createRestore(header, { recovery: 'strict', validation: 'current' })
+  }
+  for (const line of lines) restore.decodeRow(JSON.parse(line))
+  restore.finish()
 }
 
 async function generationFiles(directory) {
@@ -184,7 +203,7 @@ async function decodeArtifact(raw, path) {
   return Buffer.concat(chunks).toString('utf8')
 }
 
-/** DSH 0.1.5 JSONL move, holding native ownership at both physical locations. */
+/** DSH V3/V4 JSONL move, holding native ownership at both physical locations. */
 async function moveNativeSession(ctx, sessionId, target, workspaces, originalWorkspaceIds, options) {
   const persistence = ctx.sessionPersistence
   let handle, destinationLease, temporary
@@ -216,10 +235,7 @@ async function moveNativeSession(ctx, sessionId, target, workspaces, originalWor
     }
     // Validate the complete current artifact through the host's own catalog.
     if (!rewritten.content.endsWith('\n')) fail('invalid-artifact', 'the session artifact has an incomplete final line')
-    const lines = rewritten.content.trimEnd().split('\n')
-    const restore = persistence.generationFormat.createRestore(JSON.parse(lines.shift()))
-    for (const line of lines) restore.decodeRow(JSON.parse(line))
-    restore.finish()
+    await validateCurrentArtifact(persistence, rewritten.content)
     const destinationLocation = persistence.locate({ ...header, cwd: target.path })
     if (destinationLocation?.kind !== 'jsonl' || typeof destinationLocation.path !== 'string') {
       fail('unsupported-persistence', 'the target session artifact cannot be located')
@@ -243,6 +259,8 @@ async function moveNativeSession(ctx, sessionId, target, workspaces, originalWor
       await syncFile(backup)
     }
     await syncDirectory(backupDirectory)
+    await syncDirectory(dirname(backupDirectory))
+    await syncDirectory(dirname(dirname(backupDirectory)))
     temporary = join(dirname(destination), `.session-workspace-${jobId}.tmp`)
     await syncedWrite(temporary, await encodeRawArtifact(rewritten.content, destination))
     const currentNames = await generationFiles(sourceDirectory)
@@ -388,6 +406,8 @@ export async function moveSessionWorkspace(ctx, payload, options = {}) {
     await copyFile(source, backupPath, fsConstants.COPYFILE_EXCL)
     await syncFile(backupPath)
     await syncDirectory(backupDirectory)
+    await syncDirectory(dirname(backupDirectory))
+    await syncDirectory(dirname(dirname(backupDirectory)))
 
     await mkdir(dirname(destination), { recursive: true, mode: 0o700 })
     temporary = join(dirname(destination), `.session-workspace-${jobId}.tmp`)
