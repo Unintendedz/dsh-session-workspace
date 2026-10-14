@@ -283,6 +283,86 @@ test('dragging a session row onto a different workspace moves once and reports t
   assert.match(document.querySelector('[role="status"]').textContent, /Moved to “New”/)
 })
 
+test('cross-workspace targeting hides the source reorder marker only for the accepted target and cleans up', async (t) => {
+  const app = setup()
+  let disposed = false
+  t.after(() => { if (!disposed) app.teardown() })
+
+  const tree = document.createElement('div')
+  tree.setAttribute('role', 'tree')
+  const source = document.createElement('div')
+  source.dataset.rowKey = 'session:session-one'
+  source.className = 'host-session-row host-drop-before host-drop-after'
+  const siblingMarker = document.createElement('div')
+  siblingMarker.dataset.rowKey = 'session:source-warm-row'
+  siblingMarker.className = 'host-session-row host-drop-before'
+  const sourceWorkspace = document.createElement('div')
+  sourceWorkspace.dataset.rowKey = 'workspace:old'
+  const sourceWorkspaceChild = document.createElement('span')
+  sourceWorkspace.append(sourceWorkspaceChild)
+  const targetWorkspace = document.createElement('div')
+  targetWorkspace.dataset.rowKey = 'workspace:new'
+  const targetWorkspaceChild = document.createElement('span')
+  targetWorkspace.append(targetWorkspaceChild)
+  const outside = document.createElement('div')
+  tree.append(source, siblingMarker, sourceWorkspace, targetWorkspace)
+  const otherTree = document.createElement('div')
+  otherTree.setAttribute('role', 'tree')
+  const unrelatedSession = document.createElement('div')
+  unrelatedSession.dataset.rowKey = 'session:unrelated'
+  otherTree.append(unrelatedSession)
+  document.body.append(tree, outside, otherTree)
+
+  let sourceWorkspaceDragOver = false
+  sourceWorkspace.addEventListener('dragover', () => { sourceWorkspaceDragOver = true })
+  const activeTreeSelector = '[role="tree"][data-dsw-cross-workspace-drop-active="true"]'
+  const hiddenMarkerSelector = `${activeTreeSelector} [data-row-key^="session:"]`
+  const styles = document.getElementById('dsh-session-workspace-style').textContent
+  assert.ok(styles.includes(`${hiddenMarkerSelector}::before`))
+  assert.ok(styles.includes(`${hiddenMarkerSelector}::after`))
+
+  dispatchDrag(app.dom, source, 'dragstart')
+  await flush()
+  dispatchDrag(app.dom, targetWorkspaceChild, 'dragover')
+  assert.equal(tree.getAttribute('data-dsw-cross-workspace-drop-active'), 'true')
+  assert.deepEqual(Array.from(document.querySelectorAll(hiddenMarkerSelector)), [source, siblingMarker],
+    'the tree-scoped override also matches the SDK marker row beside the dragged source')
+  assert.equal(source.classList.contains('host-drop-after'), true)
+  assert.equal(siblingMarker.classList.contains('host-drop-before'), true, 'host marker classes remain intact while the scoped CSS hides both marker rows')
+  assert.equal(unrelatedSession.matches(hiddenMarkerSelector), false, 'other sidebar trees are not hidden')
+  assert.equal(targetWorkspace.getAttribute('data-dsw-drop-target'), 'true')
+
+  const backToSource = dispatchDrag(app.dom, sourceWorkspaceChild, 'dragover')
+  assert.equal(tree.hasAttribute('data-dsw-cross-workspace-drop-active'), false)
+  assert.equal(backToSource.defaultPrevented, false)
+  assert.equal(sourceWorkspaceDragOver, true, 'returning to Source leaves host drag handling enabled')
+  assert.equal(source.classList.contains('host-drop-after'), true)
+  assert.equal(siblingMarker.classList.contains('host-drop-before'), true)
+  assert.equal(targetWorkspace.hasAttribute('data-dsw-drop-target'), false)
+
+  dispatchDrag(app.dom, targetWorkspaceChild, 'dragover')
+  assert.equal(tree.getAttribute('data-dsw-cross-workspace-drop-active'), 'true')
+  dispatchDrag(app.dom, outside, 'dragover')
+  assert.equal(tree.hasAttribute('data-dsw-cross-workspace-drop-active'), false, 'leaving the target restores the native marker')
+
+  dispatchDrag(app.dom, targetWorkspaceChild, 'dragover')
+  assert.equal(tree.getAttribute('data-dsw-cross-workspace-drop-active'), 'true')
+  dispatchDrag(app.dom, source, 'dragend')
+  assert.equal(tree.hasAttribute('data-dsw-cross-workspace-drop-active'), false)
+  assert.equal(source.classList.contains('host-drop-after'), true)
+  assert.equal(siblingMarker.classList.contains('host-drop-before'), true)
+
+  dispatchDrag(app.dom, source, 'dragstart')
+  await flush()
+  dispatchDrag(app.dom, targetWorkspaceChild, 'dragover')
+  assert.equal(tree.getAttribute('data-dsw-cross-workspace-drop-active'), 'true')
+  app.teardown()
+  disposed = true
+  assert.equal(tree.hasAttribute('data-dsw-cross-workspace-drop-active'), false, 'plugin cleanup removes the tree-scoped marker override')
+  assert.equal(source.classList.contains('host-drop-after'), true)
+  assert.equal(siblingMarker.classList.contains('host-drop-before'), true)
+})
+
 test('dragging an active session displays the backend safety reason without accepting a drop', async (t) => {
   const app = setup({ sessionState: state({ active: true }) })
   t.after(() => app.teardown())

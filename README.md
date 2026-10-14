@@ -31,7 +31,7 @@ Build and install the checked-out version:
 npm ci
 npm run build
 npm pack
-dsh plugin --profile web add ./dsh-session-workspace-0.2.2.tgz
+dsh plugin --profile web add ./dsh-session-workspace-0.2.3.tgz
 ```
 
 Use `--profile desktop` instead of `--profile web` for the official desktop app.
@@ -47,9 +47,9 @@ Install the built archive and reload its profile. The native path supports V3 an
 1. Use a cold session with no Host Agent or open write handle. In DSH `0.2.0-rc.2`, switching to another session releases the UI view but keeps the Host Agent and its write handle. After a normal, safe DSH restart, move the session before opening it again.
 2. Use either entry point:
    - **Menu:** open that session's **⋯** menu, select **Move to another workspace**, choose the destination and confirm.
-   - **Drag:** in a workspace-grouped sidebar, drag the session row onto the destination workspace's folder/title row and release. A result or refusal is shown in a toast.
+   - **Drag:** in a workspace-grouped sidebar, drag the session row onto the destination workspace's folder/title row, wait for its highlight, and release. A result or refusal is shown in a toast.
 
-Same-workspace session reordering and dragging workspace groups remain native DSH actions. Flat-list mode has no workspace drop targets; use the menu there.
+While a valid destination workspace is highlighted, stale native session-reorder lines are hidden. Leaving the target or ending the drag restores the native indicators. Same-workspace session reordering and dragging workspace groups remain native DSH actions. Flat-list mode has no workspace drop targets; use the menu there.
 
 The session remains at the same ID and appears under the destination workspace. Future shell, filesystem, and sandbox operations use the destination workspace path.
 

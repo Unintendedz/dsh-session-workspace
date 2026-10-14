@@ -5,6 +5,7 @@ const STYLE_ID = 'dsh-session-workspace-style'
 const RPC_PATH = '/dsh-session-workspace'
 const SESSION_MENU_SLOT = 'sidebar.workspaces.session.menu.item'
 const MENU_ITEM_ID = `${NS}.move`
+const CROSS_WORKSPACE_TREE_ATTRIBUTE = 'data-dsw-cross-workspace-drop-active'
 
 const zh = {
   'menu.move': '移动到其他工作区',
@@ -361,11 +362,19 @@ function installSessionDragAndDrop(ctx, t) {
     highlighted?.removeAttribute('data-dsw-drop-target')
     highlighted = undefined
   }
+  const setNativeMarkerHidden = (current, hidden) => {
+    if (current?.sourceTree?.isConnected !== true) return
+    if (hidden) current.sourceTree.setAttribute(CROSS_WORKSPACE_TREE_ATTRIBUTE, 'true')
+    else current.sourceTree.removeAttribute(CROSS_WORKSPACE_TREE_ATTRIBUTE)
+  }
   const onDragStart = (event) => {
     const sessionId = sessionIdFromElement(event.target)
     if (sessionId === undefined) return
     clearHighlight()
-    const current = { sessionId, state: undefined, handled: false }
+    setNativeMarkerHidden(drag, false)
+    const sourceRow = event.target?.closest?.('[data-row-key^="session:"]') ?? event.target
+    const sourceTree = sourceRow?.closest?.('[role="tree"]')
+    const current = { sessionId, sourceTree, state: undefined, handled: false }
     drag = current
     current.statePromise = Promise.resolve().then(() => ctx.connection.rpc.call(RPC_PATH, 'state', { sessionId }))
       .then((result) => {
@@ -393,10 +402,12 @@ function installSessionDragAndDrop(ctx, t) {
     if (current === undefined) return
     if (workspaceId === undefined) {
       clearHighlight()
+      setNativeMarkerHidden(current, false)
       return
     }
     const dataTransfer = event.dataTransfer
     if (current.state === undefined) {
+      setNativeMarkerHidden(current, false)
       if (current.failureMessage !== undefined) return
       event.preventDefault()
       event.stopPropagation()
@@ -407,11 +418,13 @@ function installSessionDragAndDrop(ctx, t) {
     if (!model.canMove || workspaceId === current.state.currentWorkspaceId
       || !model.choices.some(workspace => workspace.workspaceId === workspaceId)) {
       clearHighlight()
+      setNativeMarkerHidden(current, false)
       return
     }
     event.preventDefault()
     event.stopPropagation()
     if (dataTransfer !== null) dataTransfer.dropEffect = 'move'
+    setNativeMarkerHidden(current, true)
     clearHighlight()
     const row = event.target.closest('[data-row-key^="workspace:"]')
     row?.setAttribute('data-dsw-drop-target', 'true')
@@ -420,7 +433,12 @@ function installSessionDragAndDrop(ctx, t) {
   const onDrop = (event) => {
     const current = drag
     const workspaceId = workspaceIdFromElement(event.target)
-    if (current === undefined || workspaceId === undefined) return
+    if (current === undefined) return
+    if (workspaceId === undefined) {
+      clearHighlight()
+      setNativeMarkerHidden(current, false)
+      return
+    }
     if (current.handled) {
       event.preventDefault()
       event.stopPropagation()
@@ -430,12 +448,17 @@ function installSessionDragAndDrop(ctx, t) {
     if (state !== undefined) {
       const model = workspaceDialogModel(state)
       if (!model.canMove || workspaceId === state.currentWorkspaceId
-        || !model.choices.some(workspace => workspace.workspaceId === workspaceId)) return
+        || !model.choices.some(workspace => workspace.workspaceId === workspaceId)) {
+        clearHighlight()
+        setNativeMarkerHidden(current, false)
+        return
+      }
     }
     event.preventDefault()
     event.stopPropagation()
     current.handled = true
     clearHighlight()
+    setNativeMarkerHidden(current, false)
     void (async () => {
       const resolvedState = state ?? await current.statePromise
       if (resolvedState === undefined) {
@@ -477,6 +500,7 @@ function installSessionDragAndDrop(ctx, t) {
   }
   const onDragEnd = () => {
     clearHighlight()
+    setNativeMarkerHidden(drag, false)
     drag = undefined
   }
 
@@ -490,6 +514,7 @@ function installSessionDragAndDrop(ctx, t) {
     document.removeEventListener('drop', onDrop, true)
     document.removeEventListener('dragend', onDragEnd, true)
     clearHighlight()
+    setNativeMarkerHidden(drag, false)
     drag = undefined
   }
 }
@@ -502,6 +527,7 @@ function installStyles() {
 .dsw-overlay{position:fixed;inset:0;z-index:1300;display:flex;align-items:center;justify-content:center;padding:20px;background:rgba(0,0,0,.48)}
 .dsw-menu-item{box-sizing:border-box;width:100%;min-height:32px;display:flex;align-items:center;gap:8px;padding:6px 10px;border:0;border-radius:6px;color:var(--dsw-alias-label-primary);background:transparent;text-align:left;font:inherit;cursor:pointer}.dsw-menu-item:hover{background:var(--dsw-alias-interactive-bg-hover)}.dsw-menu-item:focus-visible{outline:2px solid var(--dsw-alias-state-business-primary);outline-offset:-2px}.dsw-menu-icon{width:16px;flex:none;text-align:center}
 [data-dsw-drop-target="true"]{outline:2px solid var(--dsw-alias-state-business-primary);outline-offset:1px;background:var(--dsw-alias-interactive-bg-hover)}
+[role="tree"][data-dsw-cross-workspace-drop-active="true"] [data-row-key^="session:"]::before,[role="tree"][data-dsw-cross-workspace-drop-active="true"] [data-row-key^="session:"]::after{content:none!important;display:none!important}
 .dsw-dialog{box-sizing:border-box;width:min(480px,100%);padding:20px;border:1px solid var(--dsw-alias-border-l2);border-radius:12px;color:var(--dsw-alias-label-primary);background:var(--dsw-specific-menu,var(--dsw-alias-bg-base));box-shadow:var(--dsw-shadow-lv3);font-family:var(--dsw-font-family,ui-sans-serif,system-ui,sans-serif)}
 .dsw-title{margin:0;font-size:18px;line-height:26px}.dsw-help{margin:6px 0 18px;color:var(--dsw-alias-label-secondary);font-size:13px;line-height:20px}.dsw-label{display:block;margin:12px 0 6px;color:var(--dsw-alias-label-secondary);font-size:12px;font-weight:600}.dsw-current{min-height:20px;overflow:hidden;color:var(--dsw-alias-label-primary);font-size:14px;line-height:20px;text-overflow:ellipsis;white-space:nowrap}.dsw-select{box-sizing:border-box;width:100%;min-height:44px;padding:9px 34px 9px 11px;border:1px solid var(--dsw-alias-border-l2);border-radius:8px;color:var(--dsw-alias-label-primary);background:var(--dsw-specific-input-major,var(--dsw-alias-bg-base));font:inherit;font-size:14px}.dsw-select:disabled{opacity:.55}.dsw-status{min-height:20px;margin:10px 0 0;color:var(--dsw-alias-label-secondary);font-size:12px;line-height:20px}.dsw-status[data-error=true]{color:var(--dsw-alias-state-error-primary)}.dsw-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:18px}.dsw-button{min-width:80px;min-height:40px;padding:8px 13px;border:1px solid var(--dsw-alias-border-l2);border-radius:8px;color:var(--dsw-alias-label-primary);background:transparent;font:inherit;font-size:13px;cursor:pointer}.dsw-button:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover)}.dsw-primary{border-color:var(--dsw-alias-state-business-primary);color:#fff;background:var(--dsw-alias-state-business-primary)}.dsw-button:disabled{opacity:.5;cursor:not-allowed}.dsw-button:focus-visible,.dsw-select:focus-visible{outline:2px solid var(--dsw-alias-state-business-primary);outline-offset:2px}.dsw-toast{position:fixed;right:20px;bottom:20px;z-index:1350;max-width:min(420px,calc(100vw - 40px));padding:11px 14px;border:1px solid var(--dsw-alias-state-error-primary);border-radius:8px;color:var(--dsw-alias-label-primary);background:var(--dsw-specific-menu,var(--dsw-alias-bg-base));box-shadow:var(--dsw-shadow-lv2);font:13px/20px var(--dsw-font-family,ui-sans-serif,system-ui,sans-serif)}
 @media(max-width:600px){.dsw-overlay{align-items:flex-end;padding:12px}.dsw-dialog{padding:18px}.dsw-button{min-height:44px;flex:1}.dsw-actions{width:100%}}
