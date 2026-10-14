@@ -10,6 +10,7 @@ const NATIVE_WORKSPACE_SLOT = 'sidebar.workspaces'
 const NATIVE_VIEW_PERSIST = 'dsh.workspace.view.v5'
 const FLAT_SESSION_ORDER_KEY = '__flat_session_order__'
 const SESSION_RELEASE_WAIT_MS = 2000
+const SESSION_PROJECTION_SOURCE = 'workspaceOperation'
 
 const zh = {
   'menu.move': '移动到其他工作区',
@@ -37,6 +38,8 @@ const zh = {
   'error.view-unavailable': '无法核实或释放当前会话视图；未发送移动请求。',
   'error.view-release': '当前会话仍被其他组件保留，未发送移动请求。',
   'error.view-changed': '等待期间当前会话视图已切换；未发送移动请求。',
+  'error.projection-unavailable': '当前 Native 会话服务无法刷新移动后的标题投影；未发送移动请求。',
+  'error.projection-refresh': '会话已移动，但标题加载失败：{message}',
   'error.view-release-restore': '无法准备当前会话视图：{message}；恢复原会话也失败：{restoreMessage}。未发送移动请求。',
   'error.move-restore': '移动失败：{moveMessage}；并且无法恢复原会话视图：{restoreMessage}',
   'error.view-restore': '会话已移动，但无法刷新并重新打开原会话：{message}',
@@ -68,6 +71,8 @@ const en = {
   'error.view-unavailable': 'The current session view cannot be verified or released; no move was sent.',
   'error.view-release': 'Another component still retains this session, so it was not moved.',
   'error.view-changed': 'The current session changed while waiting; no move was sent.',
+  'error.projection-unavailable': 'The Native session service cannot refresh the moved session title; no move was sent.',
+  'error.projection-refresh': 'The session moved, but its title could not be loaded: {message}',
   'error.view-release-restore': 'Could not prepare the current session view: {message}; restoring the original session also failed: {restoreMessage}. No move was sent.',
   'error.move-restore': 'The move failed: {moveMessage}; the original session view could not be restored: {restoreMessage}',
   'error.view-restore': 'The session moved, but its view could not be refreshed and reopened: {message}',
@@ -217,6 +222,9 @@ function requireMainViewRelease(ctx, sessionId, state, t) {
     throw localizedError(t, 'error.view-unavailable')
   }
   if (before.currentSessionId !== sessionId) {
+    if (typeof before.sessions.using !== 'function') {
+      throw localizedError(t, 'error.projection-unavailable')
+    }
     return { ...before, sessionId, wasCurrent: false, expectedCurrentSessionId: before.currentSessionId }
   }
 
@@ -375,6 +383,27 @@ function waitForSessionReferencesToDrain(release, t, expectedCurrentSessionId) {
   })
 }
 
+async function hydrateMovedSessionProjection(sessions, sessionId) {
+  await sessions.using(sessionId, { source: SESSION_PROJECTION_SOURCE }, async reference => {
+    await reference.ready
+    const snapshot = reference.binding?.session?.getSnapshot?.()
+    if (snapshot?.openState === 'open') return
+    const openError = snapshot?.openError
+    const summarize = value => typeof value === 'string'
+      ? value.replace(/\s+/g, ' ').slice(0, 180)
+      : undefined
+    const code = summarize(openError?.code)
+    const message = summarize(openError?.message)
+      ?? (typeof openError === 'string' ? summarize(openError) : undefined)
+    const details = [
+      `openState=${summarize(snapshot?.openState) ?? 'unknown'}`,
+      code === undefined ? undefined : `code=${code}`,
+      message === undefined ? undefined : `message=${message}`,
+    ].filter(Boolean)
+    throw new Error(details.join('; '))
+  })
+}
+
 async function moveSessionSafely(ctx, t, state, workspaceId, position, afterCommit) {
   const model = workspaceDialogModel(state)
   if (!model.canMove) throw localizedError(t, `reason.${model.reason ?? 'unsupported'}`)
@@ -433,22 +462,56 @@ async function moveSessionSafely(ctx, t, state, workspaceId, position, afterComm
   }
 
   let postMoveError
+  let postMoveErrorKind
   try {
     await afterCommit?.()
   } catch (error) {
     postMoveError = error
+    postMoveErrorKind = 'order'
   }
-  try {
-    await release.sessions.refresh()
-  } catch (error) {
-    postMoveError ??= error
+  if (release.wasCurrent) {
+    try {
+      await release.sessions.refresh()
+    } catch (error) {
+      postMoveError ??= error
+      postMoveErrorKind ??= 'refresh'
+    }
+  } else {
+    // The first list refresh learns the moved ID in its destination before
+    // using() opens a fresh generation. The final refresh publishes its title
+    // projection after that temporary follow has completed.
+    try {
+      await release.sessions.refresh()
+    } catch (error) {
+      postMoveError ??= error
+      postMoveErrorKind ??= 'refresh'
+    }
+    try {
+      // This public read opens the moved session's projection in its own
+      // temporary generation. It does not select the session in the UI.
+      await hydrateMovedSessionProjection(release.sessions, state.sessionId)
+    } catch (error) {
+      postMoveError ??= error
+      postMoveErrorKind ??= 'projection'
+    }
+    try {
+      await release.sessions.refresh()
+    } catch (error) {
+      postMoveError ??= error
+      postMoveErrorKind ??= 'refresh'
+    }
   }
+
   const restoreError = restoreMainSessionIfVacant(ctx, release, t)
   postMoveError ??= restoreError
+  postMoveErrorKind ??= restoreError === undefined ? undefined : 'restore'
   if (postMoveError !== undefined) {
     if (postMoveError.localUserMessage === true) throw postMoveError
     const message = postMoveError instanceof Error ? postMoveError.message : String(postMoveError)
-    const error = localizedError(t, afterCommit === undefined ? 'error.view-restore' : 'error.order-save', { message })
+    const errorKey = postMoveErrorKind === 'projection'
+      ? 'error.projection-refresh'
+      : afterCommit === undefined ? 'error.view-restore' : 'error.order-save'
+    const error = localizedError(t, errorKey, { message })
     error.moved = true
     throw error
   }
@@ -664,6 +727,16 @@ function mountLegacyMenuItem(ctx, anchor, sessionId, t) {
 }
 
 function installLegacyMenuFallback(ctx, t) {
+  const timers = new Set()
+  const schedule = (callback, delay) => {
+    let timer
+    timer = setTimeout(() => {
+      timers.delete(timer)
+      callback()
+    }, delay)
+    timers.add(timer)
+    return timer
+  }
   const onClick = (event) => {
     const target = event.target
     if (typeof target?.closest !== 'function') return
@@ -675,12 +748,16 @@ function installLegacyMenuFallback(ctx, t) {
     const mount = () => {
       if (mountLegacyMenuItem(ctx, button, sessionId, t)) return
       attempt += 1
-      if (attempt < 5) setTimeout(mount, 20)
+      if (attempt < 5) schedule(mount, 20)
     }
-    setTimeout(mount, 0)
+    schedule(mount, 0)
   }
   document.addEventListener('click', onClick, true)
-  return () => document.removeEventListener('click', onClick, true)
+  return () => {
+    document.removeEventListener('click', onClick, true)
+    for (const timer of timers) clearTimeout(timer)
+    timers.clear()
+  }
 }
 
 function hasModernSessionMenuSlot(ctx) {
