@@ -47,6 +47,13 @@ async function fixture({ compression = 'none', failAttach = false } = {}) {
       assert.equal(headers.get(sessionId).cwd, path)
       if (!ids.includes(sessionId)) ids.push(sessionId)
     },
+    async insertSessionBefore(sessionId, beforeSessionId) {
+      assert.ok(ids.includes(sessionId))
+      if (beforeSessionId !== undefined) assert.ok(ids.includes(beforeSessionId))
+      const without = ids.filter(id => id !== sessionId)
+      const index = beforeSessionId === undefined ? without.length : without.indexOf(beforeSessionId)
+      ids.splice(0, ids.length, ...without.slice(0, index), sessionId, ...without.slice(index))
+    },
   })
   const workspaces = [workspace('old', oldPath, oldIds), workspace('new', newPath, newIds, failAttach)]
   const ctx = {

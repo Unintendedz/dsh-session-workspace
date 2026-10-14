@@ -130,7 +130,7 @@ function assertPayload(payload) {
     fail('bad-request', 'move payload must be an object')
   }
   const keys = Object.keys(payload)
-  if (keys.some(key => key !== 'sessionId' && key !== 'workspaceId')) {
+  if (keys.some(key => key !== 'sessionId' && key !== 'workspaceId' && key !== 'position')) {
     fail('bad-request', 'move payload contains an unknown field')
   }
   if (typeof payload.sessionId !== 'string' || payload.sessionId.trim() === '') {
@@ -139,6 +139,40 @@ function assertPayload(payload) {
   if (typeof payload.workspaceId !== 'string' || payload.workspaceId.trim() === '') {
     fail('bad-request', 'workspaceId must be a non-empty string')
   }
+  if (payload.position !== undefined) {
+    const position = payload.position
+    if (position === null || typeof position !== 'object' || Array.isArray(position)
+      || Object.keys(position).some(key => key !== 'anchorSessionId' && key !== 'side')) {
+      fail('bad-request', 'position must contain only anchorSessionId and side')
+    }
+    if (typeof position.anchorSessionId !== 'string' || position.anchorSessionId.trim() === '') {
+      fail('bad-request', 'position.anchorSessionId must be a non-empty string')
+    }
+    if (position.side !== 'before' && position.side !== 'after') {
+      fail('bad-request', 'position.side must be before or after')
+    }
+  }
+}
+
+function targetInsertionAnchor(target, sessionId, position) {
+  if (position === undefined) return undefined
+  const targetSessionIds = target.sessionIds
+  const anchorIndex = targetSessionIds.indexOf(position.anchorSessionId)
+  if (anchorIndex === -1 || position.anchorSessionId === sessionId) {
+    fail('workspace-anchor-not-found', `anchor session ${JSON.stringify(position.anchorSessionId)} is not a member of the target workspace`)
+  }
+  return position.side === 'before' ? position.anchorSessionId : targetSessionIds[anchorIndex + 1]
+}
+
+function workspaceAccounts(workspaces, sessionId) {
+  return workspaces.flatMap(workspace => {
+    const sessionIds = workspace.sessionIds
+    const index = sessionIds.indexOf(sessionId)
+    return index === -1 ? [] : [{
+      workspaceId: workspace.id,
+      beforeSessionId: sessionIds[index + 1],
+    }]
+  })
 }
 
 async function refreshWorkspaceHeaders(ctx) {
@@ -204,7 +238,7 @@ async function decodeArtifact(raw, path) {
 }
 
 /** DSH V3/V4 JSONL move, holding native ownership at both physical locations. */
-async function moveNativeSession(ctx, sessionId, target, workspaces, originalWorkspaceIds, options) {
+async function moveNativeSession(ctx, sessionId, target, workspaces, originalWorkspaceAccounts, position, beforeSessionId, options) {
   const persistence = ctx.sessionPersistence
   let handle, destinationLease, temporary
   const moved = []
@@ -292,6 +326,7 @@ async function moveNativeSession(ctx, sessionId, target, workspaces, originalWor
         if (workspace.id !== target.id) await workspace.detachSession(sessionId)
       }
       await target.attachSession(sessionId)
+      if (position !== undefined) await target.insertSessionBefore(sessionId, beforeSessionId)
     } catch (error) {
       const failures = [error]
       try {
@@ -302,7 +337,7 @@ async function moveNativeSession(ctx, sessionId, target, workspaces, originalWor
       } catch (rollbackError) { failures.push(rollbackError) }
       try {
         await refreshWorkspaceHeaders(ctx)
-        await restoreWorkspaceAccounts(ctx, sessionId, originalWorkspaceIds)
+        await restoreWorkspaceAccounts(ctx, sessionId, originalWorkspaceAccounts)
       } catch (rollbackError) { failures.push(rollbackError) }
       if (failures.length > 1) throw new AggregateError(failures, `session move failed and rollback was incomplete: ${String(error)}`)
       throw error
@@ -319,13 +354,19 @@ async function moveNativeSession(ctx, sessionId, target, workspaces, originalWor
   }
 }
 
-async function restoreWorkspaceAccounts(ctx, sessionId, originalWorkspaceIds) {
-  const original = new Set(originalWorkspaceIds)
+async function restoreWorkspaceAccounts(ctx, sessionId, originalWorkspaceAccounts) {
+  const original = new Set(originalWorkspaceAccounts.map(account => account.workspaceId))
   for (const workspace of ctx.workspaceRegistry.list()) {
     if (!original.has(workspace.id)) await workspace.detachSession(sessionId)
   }
-  for (const workspace of ctx.workspaceRegistry.list()) {
-    if (original.has(workspace.id)) await workspace.attachSession(sessionId)
+  const workspaces = ctx.workspaceRegistry.list()
+  for (const account of originalWorkspaceAccounts) {
+    const workspace = workspaces.find(candidate => candidate.id === account.workspaceId)
+    if (workspace === undefined) {
+      fail('workspace-not-found', `workspace ${JSON.stringify(account.workspaceId)} disappeared during rollback`)
+    }
+    await workspace.attachSession(sessionId)
+    await workspace.insertSessionBefore(sessionId, account.beforeSessionId)
   }
 }
 
@@ -354,15 +395,19 @@ export async function moveSessionWorkspace(ctx, payload, options = {}) {
       fail('unsupported-dsh-version', 'this DSH build does not expose the workspace header refresh used by the plugin')
     }
     const workspaces = ctx.workspaceRegistry.list()
-    const originalWorkspaceIds = workspaces
-      .filter(workspace => workspace.sessionIds.includes(sessionId))
-      .map(workspace => workspace.id)
-    if (originalWorkspaceIds.includes(target.id)) {
+    const originalWorkspaceAccounts = workspaceAccounts(workspaces, sessionId)
+    const position = payload.position
+    if (originalWorkspaceAccounts.some(account => account.workspaceId === target.id)) {
       fail('same-workspace', `session ${JSON.stringify(sessionId)} already belongs to ${JSON.stringify(target.title)}`)
     }
 
+    const beforeSessionId = targetInsertionAnchor(target, sessionId, position)
+    if (position !== undefined && typeof target.insertSessionBefore !== 'function') {
+      fail('unsupported-dsh-version', 'this DSH build does not expose durable workspace session ordering')
+    }
+
     if (supportsNativeWorkspaceMove(ctx.sessionPersistence)) {
-      return await moveNativeSession(ctx, sessionId, target, workspaces, originalWorkspaceIds, options)
+      return await moveNativeSession(ctx, sessionId, target, workspaces, originalWorkspaceAccounts, position, beforeSessionId, options)
     }
     if (!ctx.sessionPersistence.supportsRawArtifacts || typeof ctx.sessionPersistence.readRaw !== 'function') {
       fail('unsupported-persistence', 'session workspace moves require per-session JSONL artifacts')
@@ -439,6 +484,7 @@ export async function moveSessionWorkspace(ctx, payload, options = {}) {
         if (workspace.id !== target.id) await workspace.detachSession(sessionId)
       }
       await target.attachSession(sessionId)
+      if (position !== undefined) await target.insertSessionBefore(sessionId, beforeSessionId)
     } catch (error) {
       const rollbackErrors = []
       try {
@@ -448,7 +494,7 @@ export async function moveSessionWorkspace(ctx, payload, options = {}) {
       }
       try {
         await refreshWorkspaceHeaders(ctx)
-        await restoreWorkspaceAccounts(ctx, sessionId, originalWorkspaceIds)
+        await restoreWorkspaceAccounts(ctx, sessionId, originalWorkspaceAccounts)
       } catch (rollbackError) {
         rollbackErrors.push(rollbackError)
       }

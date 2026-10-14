@@ -31,7 +31,7 @@ Build and install the checked-out version:
 npm ci
 npm run build
 npm pack
-dsh plugin --profile web add ./dsh-session-workspace-0.2.4.tgz
+dsh plugin --profile web add ./dsh-session-workspace-0.2.5.tgz
 ```
 
 Use `--profile desktop` instead of `--profile web` for the official desktop app.
@@ -47,9 +47,11 @@ Install the built archive and reload its profile. The native path supports V3 an
 1. Use a cold session with no Host Agent or open write handle. In DSH `0.2.0-rc.2`, switching to another session releases the UI view but keeps the Host Agent and its write handle. After a normal, safe DSH restart, move the session before opening it again.
 2. Use either entry point:
    - **Menu:** open that session's **⋯** menu, select **Move to another workspace**, choose the destination and confirm.
-   - **Drag:** in a workspace-grouped sidebar, drag the session row onto the destination group's folder/title, a session row or blank area within the group, wait for the group highlight, and release. A result or refusal is shown in a toast.
+   - **Drag:** in a workspace-grouped sidebar, drag the session row onto the destination group's folder/title, a session row or blank area within the group. Over a session row, its upper/lower half selects insertion before/after that session; the destination blue line shows the exact position. Wait for the highlight and line, then release. Header and blank-area drops use the default position. A result or refusal is shown in a toast.
 
-While a valid destination workspace is highlighted, stale native session-reorder lines are hidden. Leaving the target or ending the drag restores the native indicators. Same-workspace session reordering and dragging workspace groups remain native DSH actions. Flat-list mode has no workspace drop targets; use the menu there.
+While a valid destination workspace is highlighted, stale native session-reorder lines are hidden. The plugin draws its own destination insertion line outside the sidebar tree so that the source override does not hide it. Leaving the target or ending the drag restores the native indicators. Same-workspace session reordering and dragging workspace groups remain native DSH actions. Flat-list mode has no workspace drop targets; use the menu there.
+
+Positioned drops save the relative anchor through the public workspace ordering API and save the complete display order through DSH's existing shared sidebar Store action. This switches to native manual ordering and retains hidden/archived members and other accounts' order. New/blank and pinned sections retain DSH's fixed layout; an impossible section boundary is rejected before migration. Session IDs, history, pin and archive flags are preserved.
 
 The session remains at the same ID and appears under the destination workspace. Future shell, filesystem, and sandbox operations use the destination workspace path.
 

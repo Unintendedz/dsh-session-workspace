@@ -17,6 +17,34 @@ const state = (overrides = {}) => ({
   ...overrides,
 })
 
+function nativeSession(id, updatedAt, overrides = {}) {
+  return { id, updatedAt, blank: false, origin: 'main', retainedBy: {}, ...overrides }
+}
+
+function nativeOrderFixture({
+  orderBy = 'updated',
+  sessionOrderByAccount = {},
+  items = [
+    { workspaceId: 'old', sessionIds: ['session-one'] },
+    { workspaceId: 'new', sessionIds: ['target-first', 'target-second'] },
+  ],
+  sessions = [
+    nativeSession('session-one', 100),
+    nativeSession('target-first', 300),
+    nativeSession('target-second', 200),
+  ],
+  pinnedSessionIds = [],
+  archivedSessionIds = [],
+  archivedFilter = 'default',
+} = {}) {
+  const byId = Object.fromEntries(sessions.map(summary => [summary.id, summary]))
+  return {
+    view: { orderBy, sessionOrderByAccount, archivedFilter },
+    workspaces: { phase: 'ready', state: 'ready', items, pinnedSessionIds, archivedSessionIds },
+    sessions: { phase: 'ready', ids: sessions.map(summary => summary.id), byId },
+  }
+}
+
 const messages = {
   'menu.move': 'Move to another workspace',
   'dialog.title': 'Move session',
@@ -35,13 +63,16 @@ const messages = {
   'error.load': 'Could not load workspaces: {message}',
   'error.move': 'Move failed: {message}',
   'error.already-moving': 'A move for this session is already in progress.',
+  'error.order-unavailable': 'Native sidebar order unavailable; the session was not moved.',
+  'error.order-boundary': 'The fixed sidebar section cannot honor this insertion; the session was not moved.',
+  'error.order-save': 'The session moved, but its sidebar position could not be saved: {message}',
 }
 
 function translator(key, values = {}) {
   return Object.entries(values).reduce((value, [name, replacement]) => value.replaceAll(`{${name}}`, replacement), messages[key] ?? key)
 }
 
-function setup({ sessionState = state(), moveResult = { ok: true }, slotSnapshot = [{ name: 'sidebar.workspaces.session.menu.item' }], omitSnapshot = false } = {}) {
+function setup({ sessionState = state(), moveResult = { ok: true }, slotSnapshot = [{ name: 'sidebar.workspaces.session.menu.item' }], omitSnapshot = false, nativeOrderState, nativeOrderActionError } = {}) {
   const dom = new JSDOM('<!doctype html><html><head></head><body></body></html>', { url: 'http://localhost' })
   const previous = {
     document: globalThis.document,
@@ -56,7 +87,34 @@ function setup({ sessionState = state(), moveResult = { ok: true }, slotSnapshot
   let registrationRemoved = false
   let localeRemoved = false
   const disposers = []
+  const nativeOrders = []
+  let nativeViewSnapshot = nativeOrderState?.view
+  const nativeView = nativeOrderState === undefined ? undefined : {
+    getSnapshot: () => nativeViewSnapshot,
+    actions: {
+      setSessionOrder(accountKey, order, initialOrders) {
+        const copiedOrders = Object.fromEntries(Object.entries(initialOrders).map(([key, ids]) => [key, [...ids]]))
+        nativeOrders.push({ accountKey, order: [...order], initialOrders: copiedOrders })
+        if (nativeOrderActionError !== undefined) throw new Error(nativeOrderActionError)
+        nativeViewSnapshot = {
+          ...nativeViewSnapshot,
+          orderBy: 'manual',
+          sessionOrderByAccount: { ...copiedOrders, [accountKey]: [...order] },
+        }
+      },
+    },
+  }
+  const nativeStore = nativeView === undefined ? undefined : {
+    spec: { persist: 'dsh.workspace.view.v5' },
+    create: () => nativeView,
+  }
   const ctx = {
+    get(name) {
+      if (name === 'slots') return this.slots
+      if (name === 'workspaces' && nativeOrderState !== undefined) return { list: { getSnapshot: () => nativeOrderState.workspaces } }
+      if (name === 'sessions' && nativeOrderState !== undefined) return { list: { getSnapshot: () => nativeOrderState.sessions } }
+      return undefined
+    },
     connection: {
       rpc: {
         async call(path, method, payload) {
@@ -75,6 +133,10 @@ function setup({ sessionState = state(), moveResult = { ok: true }, slotSnapshot
         assert.equal(key, 'sidebar.workspaces.session.menu.item')
         return slotSnapshot
       } } : {}),
+      entriesOfSlot(key) {
+        assert.equal(key, 'sidebar.workspaces')
+        return nativeStore === undefined ? [] : [{ store: nativeStore }]
+      },
       inject(name, callback) {
         assert.equal(name, 'sidebar.workspaces.session.menu.item')
         return callback()
@@ -95,6 +157,7 @@ function setup({ sessionState = state(), moveResult = { ok: true }, slotSnapshot
     dom,
     ctx,
     calls,
+    nativeOrders,
     disposers,
     registration: () => registration,
     teardown() {
@@ -111,11 +174,27 @@ function setup({ sessionState = state(), moveResult = { ok: true }, slotSnapshot
   }
 }
 
-function dispatchDrag(dom, target, type, dataTransfer = { dropEffect: 'none' }) {
-  const event = new dom.window.Event(type, { bubbles: true, cancelable: true })
+function dispatchDrag(dom, target, type, dataTransfer = { dropEffect: 'none' }, coordinates = {}) {
+  const event = new dom.window.MouseEvent(type, {
+    bubbles: true,
+    cancelable: true,
+    clientX: coordinates.clientX ?? 0,
+    clientY: coordinates.clientY ?? 0,
+  })
   Object.defineProperty(event, 'dataTransfer', { value: dataTransfer })
   target.dispatchEvent(event)
   return event
+}
+
+function setRect(element, { left, top, width, height }) {
+  element.getBoundingClientRect = () => ({
+    left,
+    top,
+    width,
+    height,
+    right: left + width,
+    bottom: top + height,
+  })
 }
 
 function createWorkspaceTree() {
@@ -374,8 +453,327 @@ test('cross-workspace drops from target session content or group padding resolve
   assert.equal(collapsedTarget.container.getAttribute('data-dsw-drop-target'), 'true')
   dispatchDrag(app.dom, collapsedTarget.padding, 'drop')
   await flush()
-  assert.equal(app.calls.filter(call => call.method === 'move').at(-1).payload.workspaceId, 'empty',
-    'a collapsed/empty group resolves its own header through the transparent wrapper')
+  assert.deepEqual(app.calls.filter(call => call.method === 'move').at(-1).payload,
+    { sessionId: 'session-one', workspaceId: 'empty' },
+    'a collapsed/empty group resolves its own header through the transparent wrapper without inventing an anchor')
+})
+
+test('cross-workspace session boundaries show a plugin marker and send matching placement', async (t) => {
+  const app = setup({ nativeOrderState: nativeOrderFixture({
+    items: [
+      { workspaceId: 'old', sessionIds: ['session-one', 'old-hidden', 'current-blank'] },
+      { workspaceId: 'new', sessionIds: ['target-first', 'hidden-archive', 'target-second'] },
+    ],
+    sessions: [
+      nativeSession('session-one', 700),
+      nativeSession('old-hidden', 500),
+      nativeSession('current-blank', 1100, { blank: true, retainedBy: { mainView: 1 } }),
+      nativeSession('target-first', 900),
+      nativeSession('hidden-archive', 850),
+      nativeSession('target-second', 800),
+      nativeSession('subagent-one', 400, { origin: 'subagent' }),
+      nativeSession('loose-one', 400),
+      nativeSession('blank-other', 200, { blank: true }),
+    ],
+    archivedSessionIds: ['hidden-archive'],
+  }) })
+  let disposed = false
+  t.after(() => { if (!disposed) app.teardown() })
+  const tree = createWorkspaceTree()
+  const sourceGroup = addWorkspaceGroup(tree, 'old', ['session-one'])
+  const targetGroup = addWorkspaceGroup(tree, 'new', ['target-first', 'target-second'])
+  setRect(sourceGroup.sessions[0].row, { left: 40, top: 40, width: 280, height: 32 })
+  setRect(targetGroup.sessions[0].row, { left: 40, top: 100, width: 280, height: 32 })
+  setRect(targetGroup.sessions[1].row, { left: 40, top: 140, width: 280, height: 32 })
+  const styles = document.getElementById('dsh-session-workspace-style').textContent
+  assert.ok(styles.includes('.dsw-session-drop-marker'))
+  assert.ok(styles.includes('pointer-events:none'))
+  assert.ok(styles.includes('var(--dsw-alias-state-business-primary)'))
+
+  dispatchDrag(app.dom, sourceGroup.sessions[0].row, 'dragstart')
+  await flush()
+  const upperDrop = dispatchDrag(app.dom, targetGroup.sessions[0].child, 'dragover', undefined, { clientY: 108 })
+  assert.equal(upperDrop.defaultPrevented, true)
+  const marker = document.querySelector('.dsw-session-drop-marker')
+  assert.ok(marker)
+  assert.equal(marker.dataset.side, 'before')
+  assert.equal(marker.style.left, '40px')
+  assert.equal(marker.style.top, '93px')
+  assert.equal(marker.style.width, '280px')
+  assert.equal(marker.parentElement, document.body, 'the plugin marker sits outside the source tree pseudo-marker suppression')
+  dispatchDrag(app.dom, targetGroup.sessions[0].child, 'drop', undefined, { clientY: 108 })
+  assert.equal(document.querySelector('.dsw-session-drop-marker'), null)
+  await flush()
+  assert.deepEqual(app.calls.filter(call => call.method === 'move').map(call => call.payload), [
+    { sessionId: 'session-one', workspaceId: 'new', position: { anchorSessionId: 'target-first', side: 'before' } },
+  ])
+  assert.deepEqual(app.nativeOrders[0], {
+    accountKey: 'new',
+    order: ['session-one', 'target-first', 'hidden-archive', 'target-second'],
+    initialOrders: {
+      old: ['current-blank', 'old-hidden'],
+      new: ['session-one', 'target-first', 'hidden-archive', 'target-second'],
+      '': ['loose-one', 'subagent-one', 'blank-other'],
+      __flat_session_order__: ['current-blank', 'target-first', 'hidden-archive', 'target-second', 'session-one', 'old-hidden', 'loose-one'],
+    },
+  }, 'the shared Native action receives complete orders, including hidden archive/blank/fork members, and removes the moved ID only from its source account')
+  dispatchDrag(app.dom, sourceGroup.sessions[0].row, 'dragend')
+
+  dispatchDrag(app.dom, sourceGroup.sessions[0].row, 'dragstart')
+  await flush()
+  dispatchDrag(app.dom, targetGroup.sessions[1].child, 'dragover', undefined, { clientY: 169 })
+  const lowerMarker = document.querySelector('.dsw-session-drop-marker')
+  assert.ok(lowerMarker)
+  assert.equal(lowerMarker.dataset.side, 'after')
+  assert.equal(lowerMarker.style.top, '167px')
+  dispatchDrag(app.dom, targetGroup.sessions[1].child, 'drop', undefined, { clientY: 169 })
+  assert.equal(document.querySelector('.dsw-session-drop-marker'), null)
+  await flush()
+  assert.deepEqual(app.calls.filter(call => call.method === 'move').map(call => call.payload), [
+    { sessionId: 'session-one', workspaceId: 'new', position: { anchorSessionId: 'target-first', side: 'before' } },
+    { sessionId: 'session-one', workspaceId: 'new', position: { anchorSessionId: 'target-second', side: 'after' } },
+  ])
+  assert.deepEqual(app.nativeOrders[1].order, ['target-first', 'hidden-archive', 'target-second', 'session-one'],
+    'manual order normalization retains the hidden archive and inserts after the selected UI anchor')
+  dispatchDrag(app.dom, sourceGroup.sessions[0].row, 'dragend')
+
+  dispatchDrag(app.dom, sourceGroup.sessions[0].row, 'dragstart')
+  await flush()
+  dispatchDrag(app.dom, targetGroup.sessions[0].child, 'dragover', undefined, { clientY: 108 })
+  assert.ok(document.querySelector('.dsw-session-drop-marker'))
+  const sameWorkspace = dispatchDrag(app.dom, sourceGroup.sessions[0].child, 'dragover', undefined, { clientY: 55 })
+  assert.equal(sameWorkspace.defaultPrevented, false)
+  assert.equal(document.querySelector('.dsw-session-drop-marker'), null, 'returning to the source workspace restores native reorder cues')
+  dispatchDrag(app.dom, targetGroup.sessions[0].child, 'dragover', undefined, { clientY: 108 })
+  dispatchDrag(app.dom, targetGroup.headerChild, 'dragover')
+  assert.equal(document.querySelector('.dsw-session-drop-marker'), null, 'header targeting clears the row insertion marker')
+  dispatchDrag(app.dom, targetGroup.sessions[0].child, 'dragover', undefined, { clientY: 108 })
+  dispatchDrag(app.dom, targetGroup.padding, 'dragover')
+  assert.equal(document.querySelector('.dsw-session-drop-marker'), null, 'header/padding targeting has no row boundary')
+  dispatchDrag(app.dom, targetGroup.sessions[0].child, 'dragover', undefined, { clientY: 108 })
+  dispatchDrag(app.dom, sourceGroup.sessions[0].row, 'dragend')
+  assert.equal(document.querySelector('.dsw-session-drop-marker'), null, 'dragend clears the plugin marker')
+
+  dispatchDrag(app.dom, sourceGroup.sessions[0].row, 'dragstart')
+  await flush()
+  dispatchDrag(app.dom, targetGroup.sessions[0].child, 'dragover', undefined, { clientY: 108 })
+  assert.ok(document.querySelector('.dsw-session-drop-marker'))
+  const localDocument = app.dom.window.document
+  app.teardown()
+  disposed = true
+  assert.equal(localDocument.querySelector('.dsw-session-drop-marker'), null, 'plugin cleanup removes the marker element')
+})
+
+test('Native fixed sections reject impossible boundaries and preserve the normal-after-last-pin boundary', async (t) => {
+  const app = setup({ nativeOrderState: nativeOrderFixture({
+    items: [
+      { workspaceId: 'old', sessionIds: ['session-one'] },
+      { workspaceId: 'new', sessionIds: ['blank-target', 'pin-first', 'pin-last', 'normal-first', 'normal-last'] },
+    ],
+    sessions: [
+      nativeSession('blank-target', 1000, { blank: true, retainedBy: { mainView: 1 } }),
+      nativeSession('pin-first', 900),
+      nativeSession('pin-last', 800),
+      nativeSession('normal-first', 700),
+      nativeSession('normal-last', 600),
+      nativeSession('session-one', 500),
+    ],
+    pinnedSessionIds: ['pin-first', 'pin-last'],
+  }) })
+  t.after(() => app.teardown())
+  const tree = createWorkspaceTree()
+  const sourceGroup = addWorkspaceGroup(tree, 'old', ['session-one'])
+  const targetGroup = addWorkspaceGroup(tree, 'new', ['blank-target', 'pin-first', 'pin-last', 'normal-first', 'normal-last'])
+  for (const [index, session] of targetGroup.sessions.entries()) {
+    setRect(session.row, { left: 40, top: 40 + index * 40, width: 280, height: 32 })
+  }
+
+  dispatchDrag(app.dom, sourceGroup.sessions[0].row, 'dragstart')
+  await flush()
+  dispatchDrag(app.dom, targetGroup.sessions[0].child, 'dragover', undefined, { clientY: 66 })
+  assert.equal(document.querySelector('.dsw-session-drop-marker'), null,
+    'a normal session cannot appear between the blank and pinned sections')
+  assert.equal(dispatchDrag(app.dom, targetGroup.sessions[0].child, 'drop', undefined, { clientY: 66 }).defaultPrevented, true)
+  await flush()
+  assert.equal(app.calls.some(call => call.method === 'move'), false, 'an impossible row boundary is rejected before backend migration')
+  assert.match(document.querySelector('[role="alert"]').textContent, /fixed sidebar section/)
+  dispatchDrag(app.dom, sourceGroup.sessions[0].row, 'dragend')
+
+  dispatchDrag(app.dom, sourceGroup.sessions[0].row, 'dragstart')
+  await flush()
+  dispatchDrag(app.dom, targetGroup.sessions[2].child, 'dragover', undefined, { clientY: 145 })
+  assert.equal(document.querySelector('.dsw-session-drop-marker')?.dataset.side, 'after')
+  dispatchDrag(app.dom, targetGroup.sessions[2].child, 'drop', undefined, { clientY: 145 })
+  await flush()
+  assert.deepEqual(app.calls.filter(call => call.method === 'move').map(call => call.payload), [
+    { sessionId: 'session-one', workspaceId: 'new', position: { anchorSessionId: 'pin-last', side: 'after' } },
+  ])
+  assert.deepEqual(app.nativeOrders[0].order,
+    ['blank-target', 'pin-first', 'pin-last', 'session-one', 'normal-first', 'normal-last'],
+    'the public store action places the normal session first in the ordinary section')
+})
+
+test('manual native orders retain saved unknown members and append unsaved members without summaries', async (t) => {
+  const app = setup({ nativeOrderState: nativeOrderFixture({
+    orderBy: 'manual',
+    items: [
+      { workspaceId: 'old', sessionIds: ['session-one', 'old-hidden'] },
+      { workspaceId: 'new', sessionIds: ['target-first', 'hidden-archive', 'target-second', 'target-fork', 'pending-saved', 'pending-unseeded'] },
+    ],
+    sessions: [
+      nativeSession('session-one', 100),
+      nativeSession('old-hidden', 90),
+      nativeSession('target-first', 80),
+      nativeSession('hidden-archive', 70),
+      nativeSession('target-second', 60),
+      nativeSession('target-fork', 110, { parentId: 'target-first' }),
+    ],
+    sessionOrderByAccount: {
+      old: ['session-one', 'old-hidden', 'stale-no-longer-member'],
+      new: ['target-second', 'pending-saved', 'hidden-archive', 'target-first'],
+      '': [],
+      __flat_session_order__: ['session-one', 'target-second', 'hidden-archive', 'target-first', 'old-hidden'],
+    },
+    archivedSessionIds: ['hidden-archive'],
+  }) })
+  t.after(() => app.teardown())
+  const tree = createWorkspaceTree()
+  const sourceGroup = addWorkspaceGroup(tree, 'old', ['session-one'])
+  const targetGroup = addWorkspaceGroup(tree, 'new', ['target-second', 'target-fork', 'target-first'])
+  setRect(targetGroup.sessions[0].row, { left: 40, top: 100, width: 280, height: 32 })
+
+  dispatchDrag(app.dom, sourceGroup.sessions[0].row, 'dragstart')
+  await flush()
+  dispatchDrag(app.dom, targetGroup.sessions[0].child, 'dragover', undefined, { clientY: 108 })
+  assert.equal(document.querySelector('.dsw-session-drop-marker')?.dataset.side, 'before')
+  dispatchDrag(app.dom, targetGroup.sessions[0].child, 'drop', undefined, { clientY: 108 })
+  await flush()
+  assert.deepEqual(app.nativeOrders[0].order,
+    ['session-one', 'target-second', 'pending-saved', 'hidden-archive', 'target-fork', 'target-first', 'pending-unseeded'],
+    'manual relative order, fork-before-parent placement, saved members without summaries, and newly observed Host members all survive')
+  assert.equal(app.nativeOrders[0].initialOrders.old.includes('stale-no-longer-member'), false,
+    'stale entries that are no longer account members are normalized away')
+  assert.deepEqual(app.calls.filter(call => call.method === 'move').at(-1).payload,
+    { sessionId: 'session-one', workspaceId: 'new', position: { anchorSessionId: 'target-second', side: 'before' } })
+})
+
+test('a normal session can be inserted after the blank row when the target has no pins', async (t) => {
+  const app = setup({ nativeOrderState: nativeOrderFixture({
+    items: [
+      { workspaceId: 'old', sessionIds: ['session-one'] },
+      { workspaceId: 'new', sessionIds: ['blank-target', 'normal-first', 'normal-last'] },
+    ],
+    sessions: [
+      nativeSession('blank-target', 1000, { blank: true, retainedBy: { mainView: 1 } }),
+      nativeSession('normal-first', 900),
+      nativeSession('normal-last', 800),
+      nativeSession('session-one', 700),
+    ],
+  }) })
+  t.after(() => app.teardown())
+  const tree = createWorkspaceTree()
+  const sourceGroup = addWorkspaceGroup(tree, 'old', ['session-one'])
+  const targetGroup = addWorkspaceGroup(tree, 'new', ['blank-target', 'normal-first', 'normal-last'])
+  targetGroup.sessions.forEach((session, index) => setRect(session.row, { left: 40, top: 40 + index * 40, width: 280, height: 32 }))
+
+  dispatchDrag(app.dom, sourceGroup.sessions[0].row, 'dragstart')
+  await flush()
+  dispatchDrag(app.dom, targetGroup.sessions[0].child, 'dragover', undefined, { clientY: 66 })
+  assert.equal(document.querySelector('.dsw-session-drop-marker')?.dataset.side, 'after')
+  dispatchDrag(app.dom, targetGroup.sessions[0].child, 'drop', undefined, { clientY: 66 })
+  await flush()
+  assert.deepEqual(app.calls.filter(call => call.method === 'move').at(-1).payload,
+    { sessionId: 'session-one', workspaceId: 'new', position: { anchorSessionId: 'blank-target', side: 'after' } })
+  assert.deepEqual(app.nativeOrders[0].order, ['blank-target', 'session-one', 'normal-first', 'normal-last'])
+})
+
+test('a pinned source can be inserted immediately before the first ordinary target row', async (t) => {
+  const app = setup({ nativeOrderState: nativeOrderFixture({
+    items: [
+      { workspaceId: 'old', sessionIds: ['pinned-source'] },
+      { workspaceId: 'new', sessionIds: ['pin-first', 'pin-last', 'normal-first', 'normal-last'] },
+    ],
+    sessions: [
+      nativeSession('normal-first', 1000),
+      nativeSession('pin-first', 900),
+      nativeSession('pin-last', 800),
+      nativeSession('normal-last', 700),
+      nativeSession('pinned-source', 600),
+    ],
+    pinnedSessionIds: ['pinned-source', 'pin-first', 'pin-last'],
+  }) })
+  t.after(() => app.teardown())
+  const tree = createWorkspaceTree()
+  const sourceGroup = addWorkspaceGroup(tree, 'old', ['pinned-source'])
+  const targetGroup = addWorkspaceGroup(tree, 'new', ['pin-first', 'pin-last', 'normal-first', 'normal-last'])
+  targetGroup.sessions.forEach((session, index) => setRect(session.row, { left: 40, top: 40 + index * 40, width: 280, height: 32 }))
+
+  dispatchDrag(app.dom, sourceGroup.sessions[0].row, 'dragstart')
+  await flush()
+  dispatchDrag(app.dom, targetGroup.sessions[2].child, 'dragover', undefined, { clientY: 124 })
+  assert.equal(document.querySelector('.dsw-session-drop-marker')?.dataset.side, 'before')
+  dispatchDrag(app.dom, targetGroup.sessions[2].child, 'drop', undefined, { clientY: 124 })
+  await flush()
+  assert.deepEqual(app.calls.filter(call => call.method === 'move').at(-1).payload,
+    { sessionId: 'pinned-source', workspaceId: 'new', position: { anchorSessionId: 'normal-first', side: 'before' } })
+  assert.deepEqual(app.nativeOrders[0].order,
+    ['normal-first', 'pin-first', 'pin-last', 'pinned-source', 'normal-last'],
+    'the native pinned projection renders the new pin after the existing pins and before ordinary sessions')
+})
+
+test('a session-row position fails visibly before migration when the public Native view is unavailable', async (t) => {
+  const app = setup()
+  t.after(() => app.teardown())
+  const tree = createWorkspaceTree()
+  const sourceGroup = addWorkspaceGroup(tree, 'old', ['session-one'])
+  const targetGroup = addWorkspaceGroup(tree, 'new', ['target-first'])
+  setRect(targetGroup.sessions[0].row, { left: 40, top: 100, width: 280, height: 32 })
+
+  dispatchDrag(app.dom, sourceGroup.sessions[0].row, 'dragstart')
+  await flush()
+  dispatchDrag(app.dom, targetGroup.sessions[0].child, 'dragover', undefined, { clientY: 108 })
+  assert.equal(document.querySelector('.dsw-session-drop-marker'), null)
+  dispatchDrag(app.dom, targetGroup.sessions[0].child, 'drop', undefined, { clientY: 108 })
+  await flush()
+  assert.equal(app.calls.some(call => call.method === 'move'), false)
+  assert.match(document.querySelector('[role="alert"]').textContent, /Native sidebar order unavailable/)
+})
+
+test('Native order is written only after migration, and a failed local order write is reported honestly', async (t) => {
+  const rejected = setup({
+    nativeOrderState: nativeOrderFixture(),
+    moveResult: { ok: false, error: { message: 'backend rejected the move' } },
+  })
+  let rejectedDisposed = false
+  t.after(() => { if (!rejectedDisposed) rejected.teardown() })
+  let tree = createWorkspaceTree()
+  let sourceGroup = addWorkspaceGroup(tree, 'old', ['session-one'])
+  let targetGroup = addWorkspaceGroup(tree, 'new', ['target-first'])
+  setRect(targetGroup.sessions[0].row, { left: 40, top: 100, width: 280, height: 32 })
+  dispatchDrag(rejected.dom, sourceGroup.sessions[0].row, 'dragstart')
+  await flush()
+  dispatchDrag(rejected.dom, targetGroup.sessions[0].child, 'dragover', undefined, { clientY: 108 })
+  dispatchDrag(rejected.dom, targetGroup.sessions[0].child, 'drop', undefined, { clientY: 108 })
+  await flush()
+  assert.equal(rejected.nativeOrders.length, 0, 'a backend rejection does not persist a destination order')
+  assert.match(rejected.dom.window.document.querySelector('[role="alert"]').textContent, /backend rejected the move/)
+  rejected.teardown()
+  rejectedDisposed = true
+
+  const localFailure = setup({ nativeOrderState: nativeOrderFixture(), nativeOrderActionError: 'storage blocked' })
+  t.after(() => localFailure.teardown())
+  tree = createWorkspaceTree()
+  sourceGroup = addWorkspaceGroup(tree, 'old', ['session-one'])
+  targetGroup = addWorkspaceGroup(tree, 'new', ['target-first'])
+  setRect(targetGroup.sessions[0].row, { left: 40, top: 100, width: 280, height: 32 })
+  dispatchDrag(localFailure.dom, sourceGroup.sessions[0].row, 'dragstart')
+  await flush()
+  dispatchDrag(localFailure.dom, targetGroup.sessions[0].child, 'dragover', undefined, { clientY: 108 })
+  dispatchDrag(localFailure.dom, targetGroup.sessions[0].child, 'drop', undefined, { clientY: 108 })
+  await flush()
+  assert.equal(localFailure.calls.filter(call => call.method === 'move').length, 1)
+  assert.match(localFailure.dom.window.document.querySelector('[role="alert"]').textContent,
+    /session moved, but its sidebar position could not be saved: storage blocked/i)
 })
 
 test('workspace target resolution stays inside its public tree and does not infer a root target', async (t) => {

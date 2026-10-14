@@ -68,6 +68,12 @@ async function startRegistry(ctx, WorkspaceRegistry) {
   return ctx.workspaceRegistry
 }
 
+async function setWorkspaceOrder(workspace, sessionIds) {
+  for (let index = sessionIds.length - 1; index >= 0; index--) {
+    await workspace.insertSessionBefore(sessionIds[index], sessionIds[index + 1])
+  }
+}
+
 function migrationContext(ctx) {
   return {
     sessionPersistence: ctx.sessionPersistence,
@@ -224,6 +230,116 @@ test('native registry restores durable membership and source artifact after targ
       assert.equal(reopened.header.cwd, sourcePath)
     } finally {
       await reopened.close()
+    }
+  } finally {
+    await ctx?.fiber.dispose()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('native registry persists before/after middle insertion and restores ordering on rollback', native, async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-workspace-registry-position-'))
+  const sourcePath = join(root, 'source-workspace')
+  const targetPath = join(root, 'target-workspace')
+  await mkdir(sourcePath)
+  await mkdir(targetPath)
+  const targetIds = ['position-target-first', 'position-target-middle', 'position-target-last']
+  const beforeId = 'position-move-before'
+  const afterId = 'position-move-after'
+  const sourceIds = ['position-source-first', 'position-rollback', beforeId, afterId, 'position-source-last', 'position-invalid-anchor']
+  const movedIds = [beforeId, afterId]
+  let ctx
+  try {
+    let stack = await contextFor(root, 'none')
+    ctx = stack.ctx
+    const expectedEvents = new Map()
+    for (const id of new Set([...targetIds, ...sourceIds, ...movedIds])) {
+      const { events } = await seedSession(ctx, id, targetIds.includes(id) ? targetPath : sourcePath)
+      expectedEvents.set(id, events)
+    }
+    let registry = await startRegistry(ctx, stack.WorkspaceRegistry)
+    let source = registry.list().find(workspace => workspace.sessionIds.includes(sourceIds[0]))
+    let target = registry.list().find(workspace => workspace.sessionIds.includes(targetIds[0]))
+    assert.ok(source, JSON.stringify(registry.list().map(workspace => ({ id: workspace.id, path: workspace.path, sessionIds: workspace.sessionIds }))))
+    assert.ok(target, JSON.stringify(registry.list().map(workspace => ({ id: workspace.id, path: workspace.path, sessionIds: workspace.sessionIds }))))
+    const sourceId = source.id
+    const targetId = target.id
+    const targetWorkspacePath = target.path
+    await setWorkspaceOrder(source, sourceIds)
+    await setWorkspaceOrder(target, targetIds)
+    assert.deepEqual(source.sessionIds, sourceIds)
+    assert.deepEqual(target.sessionIds, targetIds)
+
+    const invalidHandle = await ctx.sessionPersistence.open('position-invalid-anchor', 'read')
+    const invalidHeader = invalidHandle.header
+    await invalidHandle.close()
+    const invalidPath = ctx.sessionPersistence.locate(invalidHeader).path
+    const invalidOriginalBytes = await readFile(invalidPath)
+    const sourceBeforeInvalid = [...source.sessionIds]
+    const targetBeforeInvalid = [...target.sessionIds]
+    await assert.rejects(moveSessionWorkspace(migrationContext(ctx), {
+      sessionId: 'position-invalid-anchor',
+      workspaceId: targetId,
+      position: { anchorSessionId: 'not-in-target', side: 'before' },
+    }), error => error.code === 'workspace-anchor-not-found')
+    assert.deepEqual(await readFile(invalidPath), invalidOriginalBytes)
+    assert.deepEqual(source.sessionIds, sourceBeforeInvalid)
+    assert.deepEqual(target.sessionIds, targetBeforeInvalid)
+
+    const rollbackHandle = await ctx.sessionPersistence.open('position-rollback', 'read')
+    const rollbackHeader = rollbackHandle.header
+    await rollbackHandle.close()
+    const rollbackPath = ctx.sessionPersistence.locate(rollbackHeader).path
+    const rollbackBytes = await readFile(rollbackPath)
+    const sourceBeforeRollback = [...source.sessionIds]
+    const targetBeforeRollback = [...target.sessionIds]
+    const insertSessionBefore = target.insertSessionBefore
+    target.insertSessionBefore = async (sessionId, beforeSessionId) => {
+      if (sessionId === 'position-rollback') throw new Error('controlled native ordering failure')
+      return insertSessionBefore.call(target, sessionId, beforeSessionId)
+    }
+    await assert.rejects(moveSessionWorkspace(migrationContext(ctx), {
+      sessionId: 'position-rollback',
+      workspaceId: targetId,
+      position: { anchorSessionId: targetIds[1], side: 'after' },
+    }), /controlled native ordering failure/)
+    target.insertSessionBefore = insertSessionBefore
+    assert.deepEqual(await readFile(rollbackPath), rollbackBytes)
+    assert.deepEqual(source.sessionIds, sourceBeforeRollback)
+    assert.deepEqual(target.sessionIds, targetBeforeRollback)
+
+    await moveSessionWorkspace(migrationContext(ctx), {
+      sessionId: beforeId,
+      workspaceId: targetId,
+      position: { anchorSessionId: targetIds[1], side: 'before' },
+    })
+    await moveSessionWorkspace(migrationContext(ctx), {
+      sessionId: afterId,
+      workspaceId: targetId,
+      position: { anchorSessionId: targetIds[1], side: 'after' },
+    })
+    const targetAfterMoves = [targetIds[0], beforeId, targetIds[1], afterId, targetIds[2]]
+    assert.deepEqual(target.sessionIds, targetAfterMoves)
+
+    await ctx.fiber.dispose()
+    ctx = undefined
+    stack = await contextFor(root, 'none')
+    ctx = stack.ctx
+    registry = await startRegistry(ctx, stack.WorkspaceRegistry)
+    source = registry.get(sourceId)
+    target = registry.get(targetId)
+    assert.deepEqual(target.sessionIds, targetAfterMoves)
+    assert.deepEqual(source.sessionIds, sourceBeforeRollback.filter(id => !movedIds.includes(id)))
+
+    for (const id of [...movedIds, 'position-rollback', 'position-invalid-anchor']) {
+      const reopened = await ctx.sessionPersistence.open(id, 'read')
+      try {
+        assert.equal(reopened.header.id, id)
+        assert.equal(reopened.header.cwd, movedIds.includes(id) ? targetWorkspacePath : sourcePath)
+        assert.deepEqual((await reopened.read()).events, expectedEvents.get(id))
+      } finally {
+        await reopened.close()
+      }
     }
   } finally {
     await ctx?.fiber.dispose()

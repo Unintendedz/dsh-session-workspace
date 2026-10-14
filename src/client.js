@@ -6,6 +6,9 @@ const RPC_PATH = '/dsh-session-workspace'
 const SESSION_MENU_SLOT = 'sidebar.workspaces.session.menu.item'
 const MENU_ITEM_ID = `${NS}.move`
 const CROSS_WORKSPACE_TREE_ATTRIBUTE = 'data-dsw-cross-workspace-drop-active'
+const NATIVE_WORKSPACE_SLOT = 'sidebar.workspaces'
+const NATIVE_VIEW_PERSIST = 'dsh.workspace.view.v5'
+const FLAT_SESSION_ORDER_KEY = '__flat_session_order__'
 
 const zh = {
   'menu.move': '移动到其他工作区',
@@ -25,6 +28,9 @@ const zh = {
   'error.load': '无法读取工作区：{message}',
   'error.move': '移动失败：{message}',
   'error.already-moving': '这个会话已有一个移动操作正在进行。',
+  'error.order-unavailable': '无法读取完整的原生侧栏顺序；这次没有移动会话。请等侧栏加载完成后重试。',
+  'error.order-boundary': '原生侧栏固定了新会话和置顶分区，这个插入边界无法实现；会话没有移动。',
+  'error.order-save': '会话已移动，但无法保存侧栏插入位置：{message}',
 }
 
 const en = {
@@ -45,9 +51,12 @@ const en = {
   'error.load': 'Could not load workspaces: {message}',
   'error.move': 'Move failed: {message}',
   'error.already-moving': 'A move for this session is already in progress.',
+  'error.order-unavailable': 'The complete native sidebar order is unavailable, so the session was not moved. Wait for the sidebar to finish loading and try again.',
+  'error.order-boundary': 'The native sidebar keeps new and pinned sessions in fixed sections, so this insertion boundary cannot be honored. The session was not moved.',
+  'error.order-save': 'The session moved, but its sidebar position could not be saved: {message}',
 }
 
-export const inject = ['locale', 'connection', 'slots']
+export const inject = ['locale', 'connection', 'slots', 'sessions', 'workspaces']
 
 export function workspaceDialogModel(state) {
   const choices = state.workspaces.filter(workspace => workspace.workspaceId !== state.currentWorkspaceId)
@@ -385,11 +394,279 @@ function workspaceDropTargetFromElement(element, sourceTree) {
   return target
 }
 
+function sessionDropPosition(event, targetContainer, sourceTree) {
+  const origin = event.target?.nodeType === 1 ? event.target : event.target?.parentElement
+  const row = origin?.closest?.('[data-row-key^="session:"]')
+  if (row === null || row === undefined || row.closest?.('[role="tree"]') !== sourceTree) return undefined
+  const rowTarget = workspaceDropTargetFromElement(row, sourceTree)
+  if (rowTarget?.container !== targetContainer) return undefined
+  const anchorSessionId = sessionIdFromElement(row)
+  if (anchorSessionId === undefined) return undefined
+  const rect = row.getBoundingClientRect()
+  if (!Number.isFinite(event.clientY) || !Number.isFinite(rect.top) || !Number.isFinite(rect.height) || rect.height <= 0) return undefined
+  const side = event.clientY < rect.top + rect.height / 2 ? 'before' : 'after'
+  return { anchorSessionId, side, rect }
+}
+
+function orderByRecency(sessionIds, summaries) {
+  return sessionIds.flatMap(id => {
+    const summary = summaries[id]
+    return summary === undefined ? [] : [{ id, rank: summary.updatedAt }]
+  }).sort((a, b) => {
+    if (a.rank !== b.rank) return b.rank - a.rank
+    return a.id < b.id ? -1 : 1
+  }).map(member => member.id)
+}
+
+function reconcileManualOrder(memberIds, savedOrder, summaries, pinnedSessionIds, archivedSessionIds) {
+  const members = new Map(memberIds.map(id => [id, id]))
+  const included = new Set()
+  const ordered = []
+  for (const key of savedOrder ?? []) {
+    const id = members.get(key)
+    if (id === undefined || included.has(key)) continue
+    ordered.push(id)
+    included.add(key)
+  }
+
+  const archived = new Set(archivedSessionIds)
+  const pins = []
+  for (const id of pinnedSessionIds) {
+    if (!members.has(id) || included.has(id) || archived.has(id) || summaries[id] === undefined) continue
+    pins.push(id)
+    included.add(id)
+  }
+
+  const ordinary = []
+  const archives = []
+  for (const id of orderByRecency(memberIds.filter(memberId => !included.has(memberId)), summaries)) {
+    if (archived.has(id)) archives.push(id)
+    else ordinary.push(id)
+  }
+
+  const result = [...pins, ...ordered, ...ordinary, ...archives]
+  const pending = new Set(ordinary)
+  const placeFork = id => {
+    if (!pending.delete(id)) return
+    const parentId = summaries[id]?.parentId
+    if (parentId === undefined || parentId === id || !result.includes(parentId)) return
+    placeFork(parentId)
+    result.splice(result.indexOf(id), 1)
+    result.splice(result.indexOf(parentId), 0, id)
+  }
+  for (const id of [...ordinary].reverse()) placeFork(id)
+  return result
+}
+
+function nativeMainSessionId(summaries) {
+  return Object.values(summaries).find(summary => (summary.retainedBy?.mainView ?? 0) > 0)?.id
+}
+
+function completeNativeSessionOrders(workspaceSnapshot, sessionSnapshot, viewSnapshot) {
+  if (workspaceSnapshot.phase !== 'ready' || workspaceSnapshot.state === 'loading'
+    || sessionSnapshot.phase !== 'ready') return undefined
+  if (!Array.isArray(workspaceSnapshot.items) || !Array.isArray(sessionSnapshot.ids)
+    || !Array.isArray(workspaceSnapshot.pinnedSessionIds) || !Array.isArray(workspaceSnapshot.archivedSessionIds)
+    || sessionSnapshot.byId === null || typeof sessionSnapshot.byId !== 'object'
+    || workspaceSnapshot.items.some(workspace => typeof workspace.workspaceId !== 'string' || !Array.isArray(workspace.sessionIds))) return undefined
+  if (viewSnapshot.orderBy !== 'updated' && viewSnapshot.orderBy !== 'manual') return undefined
+
+  const summaries = sessionSnapshot.byId
+  const workspaces = workspaceSnapshot.items
+  const pinnedSessionIds = Array.isArray(workspaceSnapshot.pinnedSessionIds) ? workspaceSnapshot.pinnedSessionIds : []
+  const archivedSessionIds = Array.isArray(workspaceSnapshot.archivedSessionIds) ? workspaceSnapshot.archivedSessionIds : []
+  const accounted = new Set(workspaces.flatMap(workspace => Array.isArray(workspace.sessionIds) ? workspace.sessionIds : []))
+  const current = nativeMainSessionId(summaries)
+  const currentBlank = current !== undefined && summaries[current]?.blank === true ? current : undefined
+  const members = Object.fromEntries([
+    ...workspaces.map(workspace => [workspace.workspaceId, [...workspace.sessionIds]]),
+    ['', sessionSnapshot.ids.filter(id => summaries[id] !== undefined && !accounted.has(id))],
+    [FLAT_SESSION_ORDER_KEY, sessionSnapshot.ids.filter(id => {
+      const summary = summaries[id]
+      return summary !== undefined && summary.origin !== 'subagent' && (!summary.blank || id === current)
+    })],
+  ])
+  const savedOrders = viewSnapshot.sessionOrderByAccount ?? {}
+  const orders = Object.fromEntries(Object.entries(members).map(([accountKey, memberIds]) => {
+    const ordered = viewSnapshot.orderBy === 'updated'
+      ? orderByRecency(memberIds, summaries)
+      : reconcileManualOrder(memberIds, savedOrders[accountKey], summaries, pinnedSessionIds, archivedSessionIds)
+    if (currentBlank !== undefined && memberIds.includes(currentBlank)) {
+      ordered.splice(0, ordered.length, currentBlank, ...ordered.filter(id => id !== currentBlank))
+    }
+    // Native rendering omits members while their summaries load. Keep their account slots at the tail,
+    // except manual entries already saved above, whose relative positions are part of the user's order.
+    for (const id of memberIds) if (summaries[id] === undefined && !ordered.includes(id)) ordered.push(id)
+    return [accountKey, ordered]
+  }))
+  return { members, orders, summaries, current, currentBlank, pinnedSessionIds, archivedSessionIds, viewSnapshot }
+}
+
+function nativeSessionOrderSeed(ctx, current) {
+  try {
+    const slots = ctx.get('slots')
+    const entry = slots.entriesOfSlot(NATIVE_WORKSPACE_SLOT)
+      .find(candidate => candidate.store?.spec?.persist === NATIVE_VIEW_PERSIST)
+    const view = entry?.store?.create?.()
+    const workspaces = ctx.get('workspaces')
+    const sessions = ctx.get('sessions')
+    if (view?.getSnapshot === undefined || typeof view.actions?.setSessionOrder !== 'function'
+      || workspaces?.list?.getSnapshot === undefined || sessions?.list?.getSnapshot === undefined) return undefined
+
+    const viewSnapshot = view.getSnapshot()
+    const workspaceSnapshot = workspaces.list.getSnapshot()
+    const sessionSnapshot = sessions.list.getSnapshot()
+    const cached = current.nativeOrderSeed
+    if (cached?.view === view && cached.viewSnapshot === viewSnapshot
+      && cached.workspaceSnapshot === workspaceSnapshot && cached.sessionSnapshot === sessionSnapshot) return cached
+    const complete = completeNativeSessionOrders(workspaceSnapshot, sessionSnapshot, viewSnapshot)
+    if (complete === undefined) return undefined
+    const seed = { view, viewSnapshot, workspaceSnapshot, sessionSnapshot, ...complete }
+    current.nativeOrderSeed = seed
+    return seed
+  } catch {
+    return undefined
+  }
+}
+
+function nativeVisibleSessions(accountOrder, seed) {
+  const archived = new Set(seed.archivedSessionIds)
+  const pinned = new Set(seed.pinnedSessionIds)
+  const filter = seed.viewSnapshot.archivedFilter ?? 'default'
+  const visible = accountOrder.filter(id => {
+    const summary = seed.summaries[id]
+    if (summary === undefined || summary.origin === 'subagent' || (summary.blank && id !== seed.current)) return false
+    if (filter === 'default') return !archived.has(id)
+    if (filter === 'only') return archived.has(id)
+    return true
+  })
+  const blanks = []
+  const pins = []
+  const ordinary = []
+  for (const id of visible) {
+    if (seed.summaries[id].blank) blanks.push(id)
+    else if (!archived.has(id) && pinned.has(id)) pins.push(id)
+    else ordinary.push(id)
+  }
+  return { blanks, pins, ordinary, visible: [...blanks, ...pins, ...ordinary] }
+}
+
+function insertRelative(order, sessionId, anchorSessionId, side) {
+  const next = order.filter(id => id !== sessionId)
+  const index = next.indexOf(anchorSessionId)
+  if (index === -1) return undefined
+  next.splice(index + (side === 'after' ? 1 : 0), 0, sessionId)
+  return next
+}
+
+function insertionForPartitionBoundary(order, sessionId, seed, parts, boundary, sourcePinned, pointerPosition) {
+  const pinStart = parts.blanks.length
+  const pinEnd = pinStart + parts.pins.length
+  const targetId = pointerPosition.anchorSessionId
+  const targetSummary = seed.summaries[targetId]
+  const targetArchived = seed.archivedSessionIds.includes(targetId)
+  const targetPinned = !targetArchived && seed.pinnedSessionIds.includes(targetId)
+  const targetBlank = targetSummary.blank === true
+
+  if (sourcePinned && targetPinned || !sourcePinned && !targetPinned && !targetBlank) {
+    return insertRelative(order, sessionId, targetId, pointerPosition.side)
+  }
+
+  let anchorSessionId
+  let side
+  if (sourcePinned && boundary === pinStart) {
+    if (parts.pins.length > 0) {
+      anchorSessionId = parts.pins[0]
+      side = 'before'
+    } else if (parts.blanks.length > 0) {
+      anchorSessionId = parts.blanks.at(-1)
+      side = 'after'
+    } else if (parts.ordinary.length > 0) {
+      anchorSessionId = parts.ordinary[0]
+      side = 'before'
+    }
+  } else if (sourcePinned && boundary === pinEnd) {
+    if (parts.pins.length > 0) {
+      anchorSessionId = parts.pins.at(-1)
+      side = 'after'
+    } else if (parts.ordinary.length > 0) {
+      anchorSessionId = parts.ordinary[0]
+      side = 'before'
+    } else if (parts.blanks.length > 0) {
+      anchorSessionId = parts.blanks.at(-1)
+      side = 'after'
+    }
+  } else if (!sourcePinned && boundary === pinEnd) {
+    if (targetBlank && parts.pins.length === 0) {
+      anchorSessionId = targetId
+      side = 'after'
+    } else if (parts.ordinary.length > 0) {
+      anchorSessionId = parts.ordinary[0]
+      side = 'before'
+    } else if (parts.pins.length > 0) {
+      anchorSessionId = parts.pins.at(-1)
+      side = 'after'
+    } else if (parts.blanks.length > 0) {
+      anchorSessionId = parts.blanks.at(-1)
+      side = 'after'
+    }
+  }
+  return anchorSessionId === undefined ? undefined : insertRelative(order, sessionId, anchorSessionId, side)
+}
+
+function nativeSessionOrderPlan(ctx, current, targetWorkspaceId, pointerPosition) {
+  const seed = nativeSessionOrderSeed(ctx, current)
+  if (seed === undefined) return { error: 'unavailable' }
+  const sourceKey = current.sourceWorkspaceId ?? ''
+  const sourceMembers = seed.members[sourceKey]
+  const targetMembers = seed.members[targetWorkspaceId]
+  const sourceSummary = seed.summaries[current.sessionId]
+  const targetSummary = seed.summaries[pointerPosition.anchorSessionId]
+  const targetOrder = seed.orders[targetWorkspaceId]
+  if (!Array.isArray(sourceMembers) || !sourceMembers.includes(current.sessionId)
+    || !Array.isArray(targetMembers) || !targetMembers.includes(pointerPosition.anchorSessionId)
+    || !Array.isArray(targetOrder) || !Array.isArray(seed.orders[sourceKey])
+    || sourceSummary === undefined || targetSummary === undefined
+    || !targetOrder.includes(pointerPosition.anchorSessionId)) return { error: 'unavailable' }
+  if (sourceSummary.blank === true || sourceSummary.origin === 'subagent'
+    || seed.archivedSessionIds.includes(current.sessionId)) return { error: 'boundary' }
+
+  const parts = nativeVisibleSessions(targetOrder, seed)
+  const targetIndex = parts.visible.indexOf(pointerPosition.anchorSessionId)
+  if (targetIndex === -1) return { error: 'unavailable' }
+  const boundary = targetIndex + (pointerPosition.side === 'after' ? 1 : 0)
+  const pinStart = parts.blanks.length
+  const pinEnd = pinStart + parts.pins.length
+  const sourcePinned = seed.pinnedSessionIds.includes(current.sessionId)
+    && !seed.archivedSessionIds.includes(current.sessionId)
+  const boundaryIsRepresentable = sourcePinned
+    ? boundary >= pinStart && boundary <= pinEnd
+    : boundary >= pinEnd && boundary <= parts.visible.length
+  if (!boundaryIsRepresentable) return { error: 'boundary' }
+
+  const nextOrder = insertionForPartitionBoundary(targetOrder, current.sessionId, seed, parts, boundary, sourcePinned, pointerPosition)
+  if (nextOrder === undefined) return { error: 'unavailable' }
+  const initialOrders = Object.fromEntries(Object.entries(seed.orders).map(([accountKey, order]) => [
+    accountKey,
+    accountKey === sourceKey ? order.filter(id => id !== current.sessionId)
+      : accountKey === targetWorkspaceId ? [...nextOrder]
+        : [...order],
+  ]))
+  return {
+    view: seed.view,
+    targetWorkspaceId,
+    pointerPosition,
+    nextOrder,
+    initialOrders,
+  }
+}
+
 const movingSessions = new Set()
 
 function installSessionDragAndDrop(ctx, t) {
   let drag
   let highlighted
+  let sessionMarker
 
   const clearHighlight = () => {
     highlighted?.removeAttribute('data-dsw-drop-target')
@@ -400,10 +677,26 @@ function installSessionDragAndDrop(ctx, t) {
     if (hidden) current.sourceTree.setAttribute(CROSS_WORKSPACE_TREE_ATTRIBUTE, 'true')
     else current.sourceTree.removeAttribute(CROSS_WORKSPACE_TREE_ATTRIBUTE)
   }
+  const clearSessionMarker = () => {
+    sessionMarker?.remove()
+    sessionMarker = undefined
+  }
+  const showSessionMarker = (position) => {
+    if (sessionMarker === undefined) {
+      sessionMarker = element('div', 'dsw-session-drop-marker')
+      sessionMarker.setAttribute('aria-hidden', 'true')
+      document.body.appendChild(sessionMarker)
+    }
+    sessionMarker.dataset.side = position.side
+    sessionMarker.style.left = `${position.rect.left}px`
+    sessionMarker.style.top = `${position.side === 'before' ? position.rect.top - 7 : position.rect.bottom - 5}px`
+    sessionMarker.style.width = `${position.rect.width}px`
+  }
   const onDragStart = (event) => {
     const sessionId = sessionIdFromElement(event.target)
     if (sessionId === undefined) return
     clearHighlight()
+    clearSessionMarker()
     setNativeMarkerHidden(drag, false)
     const sourceRow = event.target?.closest?.('[data-row-key^="session:"]') ?? event.target
     const sourceTree = sourceRow?.closest?.('[role="tree"]')
@@ -436,12 +729,14 @@ function installSessionDragAndDrop(ctx, t) {
     const dropTarget = workspaceDropTargetFromElement(event.target, current.sourceTree)
     if (dropTarget === undefined) {
       clearHighlight()
+      clearSessionMarker()
       setNativeMarkerHidden(current, false)
       return
     }
     const { workspaceId } = dropTarget
     const dataTransfer = event.dataTransfer
     if (current.state === undefined) {
+      clearSessionMarker()
       setNativeMarkerHidden(current, false)
       if (workspaceId === current.sourceWorkspaceId) {
         clearHighlight()
@@ -457,6 +752,7 @@ function installSessionDragAndDrop(ctx, t) {
     if (!model.canMove || workspaceId === current.state.currentWorkspaceId
       || !model.choices.some(workspace => workspace.workspaceId === workspaceId)) {
       clearHighlight()
+      clearSessionMarker()
       setNativeMarkerHidden(current, false)
       return
     }
@@ -464,6 +760,12 @@ function installSessionDragAndDrop(ctx, t) {
     event.stopPropagation()
     if (dataTransfer !== null) dataTransfer.dropEffect = 'move'
     setNativeMarkerHidden(current, true)
+    const pointerPosition = sessionDropPosition(event, dropTarget.container, current.sourceTree)
+    const orderPlan = pointerPosition === undefined
+      ? undefined
+      : nativeSessionOrderPlan(ctx, current, workspaceId, pointerPosition)
+    if (orderPlan === undefined || orderPlan.error !== undefined) clearSessionMarker()
+    else showSessionMarker(pointerPosition)
     clearHighlight()
     dropTarget.container.setAttribute('data-dsw-drop-target', 'true')
     highlighted = dropTarget.container
@@ -474,6 +776,7 @@ function installSessionDragAndDrop(ctx, t) {
     const dropTarget = workspaceDropTargetFromElement(event.target, current.sourceTree)
     if (dropTarget === undefined) {
       clearHighlight()
+      clearSessionMarker()
       setNativeMarkerHidden(current, false)
       return
     }
@@ -486,6 +789,7 @@ function installSessionDragAndDrop(ctx, t) {
     const state = current.state
     if (state === undefined && workspaceId === current.sourceWorkspaceId) {
       clearHighlight()
+      clearSessionMarker()
       setNativeMarkerHidden(current, false)
       return
     }
@@ -494,15 +798,25 @@ function installSessionDragAndDrop(ctx, t) {
       if (!model.canMove || workspaceId === state.currentWorkspaceId
         || !model.choices.some(workspace => workspace.workspaceId === workspaceId)) {
         clearHighlight()
+        clearSessionMarker()
         setNativeMarkerHidden(current, false)
         return
       }
     }
+    const pointerPosition = sessionDropPosition(event, dropTarget.container, current.sourceTree)
+    const orderPlan = pointerPosition === undefined
+      ? undefined
+      : nativeSessionOrderPlan(ctx, current, workspaceId, pointerPosition)
     event.preventDefault()
     event.stopPropagation()
     current.handled = true
     clearHighlight()
+    clearSessionMarker()
     setNativeMarkerHidden(current, false)
+    if (orderPlan?.error !== undefined) {
+      showToast(t(orderPlan.error === 'boundary' ? 'error.order-boundary' : 'error.order-unavailable'), { error: true })
+      return
+    }
     void (async () => {
       const resolvedState = state ?? await current.statePromise
       if (resolvedState === undefined) {
@@ -528,15 +842,22 @@ function installSessionDragAndDrop(ctx, t) {
         return
       }
       movingSessions.add(current.sessionId)
+      let moved = false
       try {
         const result = await ctx.connection.rpc.call(RPC_PATH, 'move', {
           sessionId: current.sessionId,
           workspaceId,
+          ...(orderPlan === undefined ? {} : { position: { anchorSessionId: orderPlan.pointerPosition.anchorSessionId, side: orderPlan.pointerPosition.side } }),
         })
         if (!result?.ok) throw new Error(resultError(result))
+        moved = true
+        if (orderPlan !== undefined) {
+          await orderPlan.view.actions.setSessionOrder(orderPlan.targetWorkspaceId, orderPlan.nextOrder, orderPlan.initialOrders)
+        }
         showToast(t('drag.moved', { title: workspace?.title ?? workspaceId }), { duration: 2200 })
       } catch (error) {
-        showToast(t('error.move', { message: error instanceof Error ? error.message : String(error) }), { error: true })
+        const message = error instanceof Error ? error.message : String(error)
+        showToast(t(moved ? 'error.order-save' : 'error.move', { message }), { error: true })
       } finally {
         movingSessions.delete(current.sessionId)
       }
@@ -544,6 +865,7 @@ function installSessionDragAndDrop(ctx, t) {
   }
   const onDragEnd = () => {
     clearHighlight()
+    clearSessionMarker()
     setNativeMarkerHidden(drag, false)
     drag = undefined
   }
@@ -558,6 +880,7 @@ function installSessionDragAndDrop(ctx, t) {
     document.removeEventListener('drop', onDrop, true)
     document.removeEventListener('dragend', onDragEnd, true)
     clearHighlight()
+    clearSessionMarker()
     setNativeMarkerHidden(drag, false)
     drag = undefined
   }
@@ -572,6 +895,7 @@ function installStyles() {
 .dsw-menu-item{box-sizing:border-box;width:100%;min-height:32px;display:flex;align-items:center;gap:8px;padding:6px 10px;border:0;border-radius:6px;color:var(--dsw-alias-label-primary);background:transparent;text-align:left;font:inherit;cursor:pointer}.dsw-menu-item:hover{background:var(--dsw-alias-interactive-bg-hover)}.dsw-menu-item:focus-visible{outline:2px solid var(--dsw-alias-state-business-primary);outline-offset:-2px}.dsw-menu-icon{width:16px;flex:none;text-align:center}
 [data-dsw-drop-target="true"]{outline:2px solid var(--dsw-alias-state-business-primary);outline-offset:1px;background:var(--dsw-alias-interactive-bg-hover)}
 [role="tree"][data-dsw-cross-workspace-drop-active="true"] [data-row-key^="session:"]::before,[role="tree"][data-dsw-cross-workspace-drop-active="true"] [data-row-key^="session:"]::after{content:none!important;display:none!important}
+.dsw-session-drop-marker{box-sizing:border-box;position:fixed;z-index:1290;height:12px;pointer-events:none;background:linear-gradient(55deg,transparent calc(50% - 1px),var(--dsw-alias-state-business-primary) calc(50% - 1px) calc(50% + 1px),transparent calc(50% + 1px)) 0 0/5px 7px no-repeat,linear-gradient(125deg,transparent calc(50% - 1px),var(--dsw-alias-state-business-primary) calc(50% - 1px) calc(50% + 1px),transparent calc(50% + 1px)) 0 5px/5px 7px no-repeat,linear-gradient(var(--dsw-alias-state-business-primary) 0 0) 4px 5px/calc(100% - 4px) 2px no-repeat}
 .dsw-dialog{box-sizing:border-box;width:min(480px,100%);padding:20px;border:1px solid var(--dsw-alias-border-l2);border-radius:12px;color:var(--dsw-alias-label-primary);background:var(--dsw-specific-menu,var(--dsw-alias-bg-base));box-shadow:var(--dsw-shadow-lv3);font-family:var(--dsw-font-family,ui-sans-serif,system-ui,sans-serif)}
 .dsw-title{margin:0;font-size:18px;line-height:26px}.dsw-help{margin:6px 0 18px;color:var(--dsw-alias-label-secondary);font-size:13px;line-height:20px}.dsw-label{display:block;margin:12px 0 6px;color:var(--dsw-alias-label-secondary);font-size:12px;font-weight:600}.dsw-current{min-height:20px;overflow:hidden;color:var(--dsw-alias-label-primary);font-size:14px;line-height:20px;text-overflow:ellipsis;white-space:nowrap}.dsw-select{box-sizing:border-box;width:100%;min-height:44px;padding:9px 34px 9px 11px;border:1px solid var(--dsw-alias-border-l2);border-radius:8px;color:var(--dsw-alias-label-primary);background:var(--dsw-specific-input-major,var(--dsw-alias-bg-base));font:inherit;font-size:14px}.dsw-select:disabled{opacity:.55}.dsw-status{min-height:20px;margin:10px 0 0;color:var(--dsw-alias-label-secondary);font-size:12px;line-height:20px}.dsw-status[data-error=true]{color:var(--dsw-alias-state-error-primary)}.dsw-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:18px}.dsw-button{min-width:80px;min-height:40px;padding:8px 13px;border:1px solid var(--dsw-alias-border-l2);border-radius:8px;color:var(--dsw-alias-label-primary);background:transparent;font:inherit;font-size:13px;cursor:pointer}.dsw-button:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover)}.dsw-primary{border-color:var(--dsw-alias-state-business-primary);color:#fff;background:var(--dsw-alias-state-business-primary)}.dsw-button:disabled{opacity:.5;cursor:not-allowed}.dsw-button:focus-visible,.dsw-select:focus-visible{outline:2px solid var(--dsw-alias-state-business-primary);outline-offset:2px}.dsw-toast{position:fixed;right:20px;bottom:20px;z-index:1350;max-width:min(420px,calc(100vw - 40px));padding:11px 14px;border:1px solid var(--dsw-alias-state-error-primary);border-radius:8px;color:var(--dsw-alias-label-primary);background:var(--dsw-specific-menu,var(--dsw-alias-bg-base));box-shadow:var(--dsw-shadow-lv2);font:13px/20px var(--dsw-font-family,ui-sans-serif,system-ui,sans-serif)}
 @media(max-width:600px){.dsw-overlay{align-items:flex-end;padding:12px}.dsw-dialog{padding:18px}.dsw-button{min-height:44px;flex:1}.dsw-actions{width:100%}}
