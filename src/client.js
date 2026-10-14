@@ -30,6 +30,7 @@ const zh = {
   'error.already-moving': '这个会话已有一个移动操作正在进行。',
   'error.order-unavailable': '无法读取完整的原生侧栏顺序；这次没有移动会话。请等侧栏加载完成后重试。',
   'error.order-boundary': '原生侧栏固定了新会话和置顶分区，这个插入边界无法实现；会话没有移动。',
+  'error.position-unsupported': '当前后端不支持会话行间定位；请重新加载本插件后重试，或拖到工作区标题/留白处移动。',
   'error.order-save': '会话已移动，但无法保存侧栏插入位置：{message}',
 }
 
@@ -53,6 +54,7 @@ const en = {
   'error.already-moving': 'A move for this session is already in progress.',
   'error.order-unavailable': 'The complete native sidebar order is unavailable, so the session was not moved. Wait for the sidebar to finish loading and try again.',
   'error.order-boundary': 'The native sidebar keeps new and pinned sessions in fixed sections, so this insertion boundary cannot be honored. The session was not moved.',
+  'error.position-unsupported': 'The current backend does not support insertion between session rows. Reload this plugin and try again, or drop on the workspace header or empty area to move the session.',
   'error.order-save': 'The session moved, but its sidebar position could not be saved: {message}',
 }
 
@@ -761,7 +763,7 @@ function installSessionDragAndDrop(ctx, t) {
     if (dataTransfer !== null) dataTransfer.dropEffect = 'move'
     setNativeMarkerHidden(current, true)
     const pointerPosition = sessionDropPosition(event, dropTarget.container, current.sourceTree)
-    const orderPlan = pointerPosition === undefined
+    const orderPlan = pointerPosition === undefined || current.state.positionSupported !== true
       ? undefined
       : nativeSessionOrderPlan(ctx, current, workspaceId, pointerPosition)
     if (orderPlan === undefined || orderPlan.error !== undefined) clearSessionMarker()
@@ -804,7 +806,7 @@ function installSessionDragAndDrop(ctx, t) {
       }
     }
     const pointerPosition = sessionDropPosition(event, dropTarget.container, current.sourceTree)
-    const orderPlan = pointerPosition === undefined
+    let orderPlan = pointerPosition === undefined || state?.positionSupported !== true
       ? undefined
       : nativeSessionOrderPlan(ctx, current, workspaceId, pointerPosition)
     event.preventDefault()
@@ -836,6 +838,17 @@ function installSessionDragAndDrop(ctx, t) {
       }
       if (workspaceId === resolvedState.currentWorkspaceId
         || !model.choices.some(workspace => workspace.workspaceId === workspaceId)) return
+      if (pointerPosition !== undefined && resolvedState.positionSupported !== true) {
+        showToast(t('error.position-unsupported'), { error: true })
+        return
+      }
+      if (pointerPosition !== undefined && orderPlan === undefined) {
+        orderPlan = nativeSessionOrderPlan(ctx, current, workspaceId, pointerPosition)
+      }
+      if (orderPlan?.error !== undefined) {
+        showToast(t(orderPlan.error === 'boundary' ? 'error.order-boundary' : 'error.order-unavailable'), { error: true })
+        return
+      }
       const workspace = model.choices.find(choice => choice.workspaceId === workspaceId)
       if (movingSessions.has(current.sessionId)) {
         showToast(t('error.already-moving'), { error: true })

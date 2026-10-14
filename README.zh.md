@@ -29,7 +29,7 @@
 npm ci
 npm run build
 npm pack
-dsh plugin --profile web add ./dsh-session-workspace-0.2.5.tgz
+dsh plugin --profile web add ./dsh-session-workspace-0.2.6.tgz
 ```
 
 官方桌面应用请改用 `--profile desktop`。
@@ -38,7 +38,9 @@ dsh plugin --profile web add ./dsh-session-workspace-0.2.5.tgz
 
 ## 更新
 
-安装构建后的归档并重新加载 profile。原生迁移分支支持 V3 与 V4 的 JSONL generation 和 write-lease hook。V4 使用第一方格式 catalog，因为新版持久化后端已不再提供 `createRestore`。压缩文件逐帧完整解码，准备好的完整文件在发布前重新验证；身份认证和 trusted-host 检查仍由 DSH 执行。未来存储版本需要重新检查兼容性。
+在插件详情页先关闭整个 `dsh-session-workspace` 插件包，等待组件停止，再安装新归档并重新开启。DSH `0.2.0-rc.2` 会缓存同一 URL 的 Host 模块；每版归档使用包含全部迁移代码的独立 Host 入口，因此完成插件包卸载／重新挂载后可加载新版，无需重启其他服务。单独更新包文件或刷新插件列表不能证明 Host 已更新。行间插入还会检查服务端能力；旧 Host 不支持时在迁移前提示重新加载。
+
+原生迁移分支支持 V3 与 V4 的 JSONL generation 和 write-lease hook。V4 使用第一方格式 catalog，因为新版持久化后端已不再提供 `createRestore`。压缩文件逐帧完整解码，准备好的完整文件在发布前重新验证；身份认证和 trusted-host 检查仍由 DSH 执行。未来存储版本需要重新检查兼容性。
 
 ## 使用
 

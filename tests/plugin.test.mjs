@@ -2,16 +2,21 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
+import { readFile } from 'node:fs/promises'
 
 import { createRpcHandler, sessionWorkspaceState } from '../src/index.js'
 import { sessionIdFromElement, workspaceDialogModel } from '../src/client.js'
 
-function context({ active = false } = {}) {
+function context({ active = false, positioned = false } = {}) {
   const oldWorkspace = {
     id: 'old', path: '/projects/old', title: 'Old', sessionIds: ['session-one'],
   }
   const newWorkspace = {
     id: 'new', path: '/projects/new', title: 'New', sessionIds: [],
+  }
+  if (positioned) {
+    oldWorkspace.insertSessionBefore = () => {}
+    newWorkspace.insertSessionBefore = () => {}
   }
   return {
     sessions: {
@@ -40,11 +45,35 @@ test('sessionWorkspaceState reports the current workspace and active safety gate
     currentPath: '/projects/old',
     active: true,
     supported: true,
+    positionSupported: false,
     workspaces: [
       { workspaceId: 'old', title: 'Old', path: '/projects/old' },
       { workspaceId: 'new', title: 'New', path: '/projects/new' },
     ],
   })
+})
+
+test('workspace state advertises positional moves only with native account insertion support', async () => {
+  assert.equal((await sessionWorkspaceState(context({ positioned: true }), { sessionId: 'session-one' })).positionSupported, true)
+  assert.equal((await sessionWorkspaceState(context(), { sessionId: 'session-one' })).positionSupported, false)
+})
+
+test('versioned Host entry includes current migration code and the positional capability', async () => {
+  const pkg = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8'))
+  const hostPath = `lib/host-${pkg.version}.mjs`
+  assert.equal(pkg.main, hostPath)
+  assert.equal(pkg.exports['.'], `./${hostPath}`)
+  assert.ok((await readFile(new URL('../cordis.patch.yml', import.meta.url), 'utf8')).includes(`name: ./${hostPath}`))
+  const host = await import(new URL(`../${hostPath}`, import.meta.url))
+  const ctx = context({ positioned: true })
+  assert.equal((await host.sessionWorkspaceState(ctx, { sessionId: 'session-one' })).positionSupported, true)
+  const result = await host.createRpcHandler(ctx)('move', {
+    sessionId: 'session-one', workspaceId: 'new',
+    position: { anchorSessionId: 'missing-anchor', side: 'before' },
+  })
+  assert.equal(result.ok, false)
+  assert.equal(result.error.code, 'workspace-anchor-not-found')
+  assert.deepEqual(result.error.details, {})
 })
 
 test('RPC handler returns stable business errors', async () => {

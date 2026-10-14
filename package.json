@@ -1,8 +1,8 @@
 {
   "name": "dsh-session-workspace",
-  "version": "0.2.5",
+  "version": "0.2.6",
   "description": "Move cold DeepSeek Harness sessions between registered workspaces",
-  "main": "src/index.js",
+  "main": "lib/host-0.2.6.mjs",
   "scripts": {
     "test": "npm run build && node --test tests/*.test.mjs && node --check src/index.js && node --check src/client.js",
     "build": "node scripts/build-client.mjs"
@@ -18,7 +18,7 @@
   "license": "MIT",
   "type": "module",
   "exports": {
-    ".": "./src/index.js",
+    ".": "./lib/host-0.2.6.mjs",
     "./client": "./lib/client.js",
     "./package.json": "./package.json"
   },

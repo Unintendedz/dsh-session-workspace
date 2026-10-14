@@ -31,7 +31,7 @@ Build and install the checked-out version:
 npm ci
 npm run build
 npm pack
-dsh plugin --profile web add ./dsh-session-workspace-0.2.5.tgz
+dsh plugin --profile web add ./dsh-session-workspace-0.2.6.tgz
 ```
 
 Use `--profile desktop` instead of `--profile web` for the official desktop app.
@@ -40,7 +40,9 @@ Restart the DSH web process after installation. The package's `cordis.patch.yml`
 
 ## Update
 
-Install the built archive and reload its profile. The native path supports V3 and V4 JSONL generation and write-lease hooks. V4 uses the first-party format catalog because DSH no longer exposes `createRestore` on the persistence backend. Compressed artifacts are decoded across all frames. The complete prepared artifact is validated before publication; authentication and trusted-host checks remain owned by DSH. Future storage versions require a compatibility check.
+Turn off the entire `dsh-session-workspace` bundle on its plugin detail page, wait for its component to stop, install the new archive, then turn the bundle back on. DSH `0.2.0-rc.2` caches Host modules at the same URL. Each archive has a versioned Host entry containing all migration code, so unloading and remounting this bundle loads the new code without restarting other services. Replacing package files or refreshing inventory alone does not prove that the Host updated. Positioned drops also check the server capability and request a plugin reload before migrating when the Host is older.
+
+The native path supports V3 and V4 JSONL generation and write-lease hooks. V4 uses the first-party format catalog because DSH no longer exposes `createRestore` on the persistence backend. Compressed artifacts are decoded across all frames. The complete prepared artifact is validated before publication; authentication and trusted-host checks remain owned by DSH. Future storage versions require a compatibility check.
 
 ## Use
 

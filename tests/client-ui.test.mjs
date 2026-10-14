@@ -10,6 +10,7 @@ const state = (overrides = {}) => ({
   currentPath: '/projects/old',
   active: false,
   supported: true,
+  positionSupported: true,
   workspaces: [
     { workspaceId: 'old', title: 'Old', path: '/projects/old' },
     { workspaceId: 'new', title: 'New', path: '/projects/new' },
@@ -45,6 +46,12 @@ function nativeOrderFixture({
   }
 }
 
+function withoutPositionSupport(value) {
+  const copy = { ...value }
+  delete copy.positionSupported
+  return copy
+}
+
 const messages = {
   'menu.move': 'Move to another workspace',
   'dialog.title': 'Move session',
@@ -65,6 +72,7 @@ const messages = {
   'error.already-moving': 'A move for this session is already in progress.',
   'error.order-unavailable': 'Native sidebar order unavailable; the session was not moved.',
   'error.order-boundary': 'The fixed sidebar section cannot honor this insertion; the session was not moved.',
+  'error.position-unsupported': 'The backend does not support row insertion; reload this plugin.',
   'error.order-save': 'The session moved, but its sidebar position could not be saved: {message}',
 }
 
@@ -243,7 +251,7 @@ async function flush() {
 }
 
 test('the official session menu slot opens the workspace chooser and moves the same session ID', async (t) => {
-  const app = setup()
+  const app = setup({ sessionState: withoutPositionSupport(state()) })
   t.after(() => app.teardown())
   const registered = app.registration()
   assert.equal(registered.config.name, 'sidebar.workspaces.session.menu.item')
@@ -737,6 +745,39 @@ test('a session-row position fails visibly before migration when the public Nati
   await flush()
   assert.equal(app.calls.some(call => call.method === 'move'), false)
   assert.match(document.querySelector('[role="alert"]').textContent, /Native sidebar order unavailable/)
+})
+
+test('an older backend without positionSupported rejects row placement but keeps header moves', async (t) => {
+  const app = setup({
+    sessionState: withoutPositionSupport(state()),
+    nativeOrderState: nativeOrderFixture(),
+  })
+  t.after(() => app.teardown())
+  const tree = createWorkspaceTree()
+  const sourceGroup = addWorkspaceGroup(tree, 'old', ['session-one'])
+  const targetGroup = addWorkspaceGroup(tree, 'new', ['target-first'])
+  setRect(targetGroup.sessions[0].row, { left: 40, top: 100, width: 280, height: 32 })
+
+  dispatchDrag(app.dom, sourceGroup.sessions[0].row, 'dragstart')
+  await flush()
+  dispatchDrag(app.dom, targetGroup.sessions[0].child, 'dragover', undefined, { clientY: 108 })
+  assert.equal(document.querySelector('.dsw-session-drop-marker'), null, 'an old backend cannot advertise an insertion line')
+  dispatchDrag(app.dom, targetGroup.sessions[0].child, 'drop', undefined, { clientY: 108 })
+  await flush()
+  assert.equal(app.calls.some(call => call.method === 'move'), false)
+  assert.equal(app.nativeOrders.length, 0)
+  assert.match(document.querySelector('[role="alert"]').textContent, /reload this plugin/i)
+
+  dispatchDrag(app.dom, sourceGroup.sessions[0].row, 'dragend')
+  dispatchDrag(app.dom, sourceGroup.sessions[0].row, 'dragstart')
+  await flush()
+  dispatchDrag(app.dom, targetGroup.headerChild, 'dragover')
+  dispatchDrag(app.dom, targetGroup.headerChild, 'drop')
+  await flush()
+  assert.deepEqual(app.calls.filter(call => call.method === 'move').map(call => call.payload), [
+    { sessionId: 'session-one', workspaceId: 'new' },
+  ], 'header-based workspace moves retain their existing no-position behavior')
+  assert.equal(app.nativeOrders.length, 0, 'default moves do not switch Native to manual ordering')
 })
 
 test('Native order is written only after migration, and a failed local order write is reported honestly', async (t) => {

@@ -22,14 +22,16 @@ export async function sessionWorkspaceState(ctx, payload) {
   }
   const workspaces = ctx.workspaceRegistry.list()
   const current = workspaces.find(workspace => workspace.sessionIds.includes(sessionId))
+  const supported = (supportsNativeWorkspaceMove(ctx.sessionPersistence)
+    || (ctx.sessionPersistence.supportsRawArtifacts === true && typeof ctx.sessionPersistence.readRaw === 'function'))
+    && typeof ctx.workspaceRegistry.replaceHeaderIndex === 'function'
   return {
     sessionId,
     currentWorkspaceId: current?.id,
     currentPath: header.cwd,
     active: live !== undefined || ctx.agents.get(sessionId) !== undefined,
-    supported: (supportsNativeWorkspaceMove(ctx.sessionPersistence)
-      || (ctx.sessionPersistence.supportsRawArtifacts === true && typeof ctx.sessionPersistence.readRaw === 'function'))
-      && typeof ctx.workspaceRegistry.replaceHeaderIndex === 'function',
+    supported,
+    positionSupported: supported && workspaces.every(workspace => typeof workspace.insertSessionBefore === 'function'),
     workspaces: workspaces.map(workspace => ({
       workspaceId: workspace.id,
       title: workspace.title,
