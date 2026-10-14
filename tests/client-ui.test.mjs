@@ -9,6 +9,8 @@ const state = (overrides = {}) => ({
   currentWorkspaceId: 'old',
   currentPath: '/projects/old',
   active: false,
+  warmMoveSupported: false,
+  busy: false,
   supported: true,
   positionSupported: true,
   workspaces: [
@@ -64,7 +66,8 @@ const messages = {
   'dialog.moved': 'Moved to “{title}”.',
   'dialog.ungrouped': 'Ungrouped',
   'drag.moved': 'Moved to “{title}”.',
-  'reason.session-active': 'This session is still active. Switch to another session, wait for it to close, then try again.',
+  'reason.session-active': 'This session is loaded and the backend cannot move loaded sessions.',
+  'reason.session-busy': 'This session has running or queued work. Wait until it is idle; moving will not stop it.',
   'reason.unsupported': 'This DSH version or persistence backend cannot move sessions safely.',
   'reason.no-targets': 'No other workspace is available.',
   'error.load': 'Could not load workspaces: {message}',
@@ -74,13 +77,17 @@ const messages = {
   'error.order-boundary': 'The fixed sidebar section cannot honor this insertion; the session was not moved.',
   'error.position-unsupported': 'The backend does not support row insertion; reload this plugin.',
   'error.order-save': 'The session moved, but its sidebar position could not be saved: {message}',
+  'error.view-unavailable': 'The current session view cannot be verified or released; no move was sent.',
+  'error.view-release': 'Another component still retains this session, so it was not moved.',
+  'error.move-restore': 'The move failed: {moveMessage}; the original session view could not be restored: {restoreMessage}',
+  'error.view-restore': 'The session moved, but its view could not be refreshed and reopened: {message}',
 }
 
 function translator(key, values = {}) {
   return Object.entries(values).reduce((value, [name, replacement]) => value.replaceAll(`{${name}}`, replacement), messages[key] ?? key)
 }
 
-function setup({ sessionState = state(), moveResult = { ok: true }, slotSnapshot = [{ name: 'sidebar.workspaces.session.menu.item' }], omitSnapshot = false, nativeOrderState, nativeOrderActionError } = {}) {
+function setup({ sessionState = state(), moveResult = { ok: true }, slotSnapshot = [{ name: 'sidebar.workspaces.session.menu.item' }], omitSnapshot = false, nativeOrderState, nativeOrderActionError, mainViewSessionId, missingClearMain = false, missingRetainInfo = false, retainAfterClear = false, clearMainError, retentionErrorAfterClearOnce = false, refreshError } = {}) {
   const dom = new JSDOM('<!doctype html><html><head></head><body></body></html>', { url: 'http://localhost' })
   const previous = {
     document: globalThis.document,
@@ -91,6 +98,7 @@ function setup({ sessionState = state(), moveResult = { ok: true }, slotSnapshot
   globalThis.window = dom.window
   globalThis.Event = dom.window.Event
   const calls = []
+  const lifecycle = []
   let registration
   let registrationRemoved = false
   let localeRemoved = false
@@ -103,6 +111,7 @@ function setup({ sessionState = state(), moveResult = { ok: true }, slotSnapshot
       setSessionOrder(accountKey, order, initialOrders) {
         const copiedOrders = Object.fromEntries(Object.entries(initialOrders).map(([key, ids]) => [key, [...ids]]))
         nativeOrders.push({ accountKey, order: [...order], initialOrders: copiedOrders })
+        lifecycle.push('setSessionOrder')
         if (nativeOrderActionError !== undefined) throw new Error(nativeOrderActionError)
         nativeViewSnapshot = {
           ...nativeViewSnapshot,
@@ -116,9 +125,80 @@ function setup({ sessionState = state(), moveResult = { ok: true }, slotSnapshot
     spec: { persist: 'dsh.workspace.view.v5' },
     create: () => nativeView,
   }
+  let selectedMainSessionId = mainViewSessionId
+  let overrideMainView = mainViewSessionId !== undefined
+  let postClearRetained = false
+  let clearAttempted = false
+  let retentionErrorThrown = false
+  const coldSummary = nativeSession(sessionState.sessionId, 0)
+  delete coldSummary.retainedBy
+  const defaultSessions = {
+    phase: 'ready',
+    ids: [sessionState.sessionId],
+    byId: { [sessionState.sessionId]: coldSummary },
+  }
+  const currentSessionSnapshot = () => {
+    const base = nativeOrderState?.sessions ?? defaultSessions
+    if (!overrideMainView) return base
+    const ids = [...base.ids]
+    const byId = Object.fromEntries(Object.entries(base.byId).map(([id, summary]) => [id, {
+      ...summary,
+      retainedBy: { ...(summary.retainedBy ?? {}), mainView: selectedMainSessionId === id ? 1 : 0 },
+    }]))
+    if (selectedMainSessionId !== undefined && byId[selectedMainSessionId] === undefined) {
+      ids.push(selectedMainSessionId)
+      byId[selectedMainSessionId] = nativeSession(selectedMainSessionId, 0, { retainedBy: { mainView: 1 } })
+    }
+    return { ...base, ids, byId }
+  }
+  const sessions = {
+    list: { getSnapshot: currentSessionSnapshot },
+    ...(!missingRetainInfo ? {
+      retainInfo(id) {
+        return {
+          getSnapshot() {
+            if (clearAttempted && retentionErrorAfterClearOnce && !retentionErrorThrown) {
+              retentionErrorThrown = true
+              throw new Error('retention snapshot temporarily unavailable')
+            }
+            const summary = currentSessionSnapshot().byId[id]
+            const retainedBy = summary?.retainedBy ?? {}
+            const referenceCount = Object.values(retainedBy).reduce((sum, count) => sum + (Number.isSafeInteger(count) ? count : 0), 0)
+              + (postClearRetained && id === mainViewSessionId ? 1 : 0)
+            return { referenceCount, retainedBy }
+          },
+        }
+      },
+    } : {}),
+    async refresh() {
+      lifecycle.push('refresh')
+      if (refreshError !== undefined) throw new Error(refreshError)
+    },
+  }
+  const uiWorkspace = {
+    ...(!missingClearMain ? {
+      clearMain() {
+        lifecycle.push('clearMain')
+        clearAttempted = true
+        overrideMainView = true
+        selectedMainSessionId = undefined
+        postClearRetained = retainAfterClear
+        if (clearMainError !== undefined) throw new Error(clearMainError)
+      },
+    } : {}),
+    openSession(id) {
+      lifecycle.push(`openSession:${id}`)
+      overrideMainView = true
+      selectedMainSessionId = id
+      postClearRetained = false
+    },
+  }
+  const sessionService = sessions
   const ctx = {
     get(name) {
       if (name === 'slots') return this.slots
+      if (name === 'sessions') return sessionService
+      if (name === 'uiWorkspace') return uiWorkspace
       if (name === 'workspaces' && nativeOrderState !== undefined) return { list: { getSnapshot: () => nativeOrderState.workspaces } }
       if (name === 'sessions' && nativeOrderState !== undefined) return { list: { getSnapshot: () => nativeOrderState.sessions } }
       return undefined
@@ -127,8 +207,9 @@ function setup({ sessionState = state(), moveResult = { ok: true }, slotSnapshot
       rpc: {
         async call(path, method, payload) {
           calls.push({ path, method, payload })
-          if (method === 'state') return { ok: true, value: sessionState }
-          return moveResult
+          if (method === 'state') return { ok: true, value: { ...sessionState, sessionId: payload.sessionId } }
+          lifecycle.push('move')
+          return typeof moveResult === 'function' ? moveResult(payload) : moveResult
         },
       },
     },
@@ -168,6 +249,14 @@ function setup({ sessionState = state(), moveResult = { ok: true }, slotSnapshot
     nativeOrders,
     disposers,
     registration: () => registration,
+    lifecycle,
+    selectMainSession(id) {
+      lifecycle.push(`user-select:${id}`)
+      overrideMainView = true
+      selectedMainSessionId = id
+      postClearRetained = false
+    },
+    mainSession: () => selectedMainSessionId,
     teardown() {
       for (const dispose of disposers.reverse()) dispose()
       dom.window.close()
@@ -250,6 +339,27 @@ async function flush() {
   await new Promise(resolve => setImmediate(resolve))
 }
 
+async function openMenuDialog(app, sessionId = 'session-one') {
+  const registered = app.registration()
+  const moveSession = registered.config.inject().moveSession
+  const button = registered.component({
+    sessionId,
+    displayTitle: 'A conversation',
+    useMenuOpenState: () => [true, () => {}],
+    moveSession,
+    t: translator,
+  })
+  const anchor = document.createElement('button')
+  document.body.append(anchor)
+  button.props.onClick({
+    preventDefault() {},
+    stopPropagation() {},
+    currentTarget: anchor,
+  })
+  await flush()
+  return document.querySelector('[role="dialog"]')
+}
+
 test('the official session menu slot opens the workspace chooser and moves the same session ID', async (t) => {
   const app = setup({ sessionState: withoutPositionSupport(state()) })
   t.after(() => app.teardown())
@@ -296,6 +406,211 @@ test('the official session menu slot opens the workspace chooser and moves the s
     payload: { sessionId: 'session-one', workspaceId: 'new' },
   })
   await new Promise(resolve => setTimeout(resolve, 750))
+})
+
+test('moving an opened idle main session from the menu releases and reopens the same ID', async (t) => {
+  const app = setup({
+    sessionState: state({ active: true, warmMoveSupported: true }),
+    mainViewSessionId: 'session-one',
+  })
+  t.after(() => app.teardown())
+
+  const dialog = await openMenuDialog(app)
+  assert.equal(dialog.querySelector('.dsw-primary').disabled, false)
+  dialog.querySelector('.dsw-primary').click()
+  await flush()
+
+  assert.deepEqual(app.lifecycle, ['clearMain', 'move', 'refresh', 'openSession:session-one'])
+  assert.equal(app.mainSession(), 'session-one')
+  assert.deepEqual(app.calls.filter(call => call.method === 'move').at(-1).payload,
+    { sessionId: 'session-one', workspaceId: 'new' })
+  await new Promise(resolve => setTimeout(resolve, 710))
+})
+
+test('precise drag of an opened idle main session releases, moves, reorders, refreshes, and reopens', async (t) => {
+  const app = setup({
+    sessionState: state({ active: true, warmMoveSupported: true }),
+    nativeOrderState: nativeOrderFixture(),
+    mainViewSessionId: 'session-one',
+  })
+  t.after(() => app.teardown())
+  const tree = createWorkspaceTree()
+  const sourceGroup = addWorkspaceGroup(tree, 'old', ['session-one'])
+  const targetGroup = addWorkspaceGroup(tree, 'new', ['target-first', 'target-second'])
+  setRect(targetGroup.sessions[0].row, { left: 40, top: 100, width: 280, height: 32 })
+
+  dispatchDrag(app.dom, sourceGroup.sessions[0].row, 'dragstart')
+  await flush()
+  dispatchDrag(app.dom, targetGroup.sessions[0].child, 'dragover', undefined, { clientY: 104 })
+  assert.equal(document.querySelector('.dsw-session-drop-marker')?.dataset.side, 'before')
+  dispatchDrag(app.dom, targetGroup.sessions[0].child, 'drop', undefined, { clientY: 104 })
+  await flush()
+
+  assert.deepEqual(app.lifecycle, ['clearMain', 'move', 'setSessionOrder', 'refresh', 'openSession:session-one'])
+  assert.equal(app.mainSession(), 'session-one')
+  assert.deepEqual(app.calls.filter(call => call.method === 'move').at(-1).payload,
+    { sessionId: 'session-one', workspaceId: 'new', position: { anchorSessionId: 'target-first', side: 'before' } })
+  assert.deepEqual(app.nativeOrders[0].order, ['session-one', 'target-first', 'target-second'])
+})
+
+test('a rejected move restores the opened main session', async (t) => {
+  const rejected = setup({
+    sessionState: state({ active: true, warmMoveSupported: true }),
+    moveResult: { ok: false, error: { message: 'backend refused the move' } },
+    mainViewSessionId: 'session-one',
+  })
+  t.after(() => rejected.teardown())
+  const dialog = await openMenuDialog(rejected)
+  dialog.querySelector('.dsw-primary').click()
+  await flush()
+  assert.deepEqual(rejected.lifecycle, ['clearMain', 'move', 'openSession:session-one'])
+  assert.equal(rejected.mainSession(), 'session-one')
+  assert.match(dialog.querySelector('.dsw-status').textContent, /backend refused the move/)
+})
+
+test('a user selection during an opened-session move is never overwritten on completion', async (t) => {
+  let resolveMove
+  const pendingMove = new Promise(resolve => { resolveMove = resolve })
+  const steered = setup({
+    sessionState: state({ active: true, warmMoveSupported: true }),
+    moveResult: () => pendingMove,
+    mainViewSessionId: 'session-one',
+  })
+  t.after(() => steered.teardown())
+  const pendingDialog = await openMenuDialog(steered)
+  pendingDialog.querySelector('.dsw-primary').click()
+  await flush()
+  assert.deepEqual(steered.lifecycle, ['clearMain', 'move'])
+  steered.selectMainSession('user-selected-session')
+  resolveMove({ ok: true })
+  await flush()
+  assert.deepEqual(steered.lifecycle,
+    ['clearMain', 'move', 'user-select:user-selected-session', 'refresh'])
+  assert.equal(steered.mainSession(), 'user-selected-session', 'completion must not reclaim the view after user navigation')
+  await new Promise(resolve => setTimeout(resolve, 710))
+})
+
+test('moving a non-current loaded session leaves the current view unchanged', async (t) => {
+  const app = setup({
+    sessionState: state({ active: true, warmMoveSupported: true }),
+    mainViewSessionId: 'already-open-session',
+  })
+  t.after(() => app.teardown())
+  const dialog = await openMenuDialog(app)
+  dialog.querySelector('.dsw-primary').click()
+  await flush()
+
+  assert.deepEqual(app.lifecycle, ['move', 'refresh'])
+  assert.equal(app.mainSession(), 'already-open-session')
+  assert.equal(app.calls.some(call => call.method === 'move'), true)
+  await new Promise(resolve => setTimeout(resolve, 710))
+})
+
+test('a current cold session also requires the backend release capability before clearMain', async (t) => {
+  const app = setup({
+    sessionState: state({ active: false, warmMoveSupported: false }),
+    mainViewSessionId: 'session-one',
+  })
+  t.after(() => app.teardown())
+  const dialog = await openMenuDialog(app)
+  assert.equal(dialog.querySelector('.dsw-primary').disabled, false, 'cold state is permitted by the general move model')
+  dialog.querySelector('.dsw-primary').click()
+  await flush()
+
+  assert.match(dialog.querySelector('.dsw-status').textContent, /cannot be verified or released/i)
+  assert.deepEqual(app.lifecycle, [], 'the internal clearMain seam is never called without the backend capability')
+  assert.equal(app.calls.some(call => call.method === 'move'), false)
+  assert.equal(app.mainSession(), 'session-one')
+})
+
+test('the menu refuses a busy or queued session without clearing the view or cancelling work', async (t) => {
+  const menuApp = setup({
+    sessionState: state({ active: true, warmMoveSupported: true, busy: true }),
+    mainViewSessionId: 'session-one',
+  })
+  t.after(() => menuApp.teardown())
+  const dialog = await openMenuDialog(menuApp)
+  assert.match(dialog.querySelector('.dsw-status').textContent, /running or queued work/i)
+  assert.equal(dialog.querySelector('.dsw-primary').disabled, true)
+  assert.deepEqual(menuApp.lifecycle, [])
+  assert.equal(menuApp.calls.some(call => call.method === 'cancel'), false)
+})
+
+test('drag refuses a busy or queued session without clearing the view or cancelling work', async (t) => {
+  const dragApp = setup({
+    sessionState: state({ active: true, warmMoveSupported: true, busy: true }),
+    mainViewSessionId: 'session-one',
+  })
+  t.after(() => dragApp.teardown())
+  const tree = createWorkspaceTree()
+  const sourceGroup = addWorkspaceGroup(tree, 'old', ['session-one'])
+  const targetGroup = addWorkspaceGroup(tree, 'new')
+  dispatchDrag(dragApp.dom, sourceGroup.sessions[0].row, 'dragstart')
+  await flush()
+  assert.match(document.querySelector('[role="alert"]').textContent, /running or queued work/i)
+  const over = dispatchDrag(dragApp.dom, targetGroup.headerChild, 'dragover')
+  assert.equal(over.defaultPrevented, false)
+  dispatchDrag(dragApp.dom, targetGroup.headerChild, 'drop')
+  await flush()
+  assert.equal(dragApp.calls.some(call => call.method === 'move' || call.method === 'cancel'), false)
+  assert.equal(dragApp.mainSession(), 'session-one')
+  assert.deepEqual(dragApp.lifecycle, [])
+})
+
+test('current-session move fails closed when the Native release seam or retention accounting is unavailable', async (t) => {
+  for (const options of [{ missingClearMain: true }, { missingRetainInfo: true }, { retainAfterClear: true }]) {
+    const app = setup({
+      sessionState: state({ active: true, warmMoveSupported: true }),
+      mainViewSessionId: 'session-one',
+      ...options,
+    })
+    const dialog = await openMenuDialog(app)
+    dialog.querySelector('.dsw-primary').click()
+    await flush()
+    assert.equal(app.calls.some(call => call.method === 'move'), false, JSON.stringify(options))
+    assert.ok(dialog.querySelector('.dsw-status').textContent.length > 0)
+    if (options.retainAfterClear) {
+      assert.deepEqual(app.lifecycle, ['clearMain', 'openSession:session-one'])
+      assert.equal(app.mainSession(), 'session-one')
+    } else {
+      assert.deepEqual(app.lifecycle, [])
+    }
+    app.teardown()
+  }
+})
+
+test('a clearMain exception restores the original main view and prevents migration', async (t) => {
+  const app = setup({
+    sessionState: state({ active: true, warmMoveSupported: true }),
+    mainViewSessionId: 'session-one',
+    clearMainError: 'clearMain failed after releasing',
+  })
+  t.after(() => app.teardown())
+  const dialog = await openMenuDialog(app)
+  dialog.querySelector('.dsw-primary').click()
+  await flush()
+
+  assert.deepEqual(app.lifecycle, ['clearMain', 'openSession:session-one'])
+  assert.equal(app.mainSession(), 'session-one')
+  assert.equal(app.calls.some(call => call.method === 'move'), false)
+  assert.match(dialog.querySelector('.dsw-status').textContent, /clearMain failed after releasing/)
+})
+
+test('a transient retention snapshot failure after clear restores before any move RPC', async (t) => {
+  const app = setup({
+    sessionState: state({ active: true, warmMoveSupported: true }),
+    mainViewSessionId: 'session-one',
+    retentionErrorAfterClearOnce: true,
+  })
+  t.after(() => app.teardown())
+  const dialog = await openMenuDialog(app)
+  dialog.querySelector('.dsw-primary').click()
+  await flush()
+
+  assert.deepEqual(app.lifecycle, ['clearMain', 'openSession:session-one'])
+  assert.equal(app.mainSession(), 'session-one')
+  assert.equal(app.calls.some(call => call.method === 'move'), false)
+  assert.match(dialog.querySelector('.dsw-status').textContent, /retention snapshot temporarily unavailable/)
 })
 
 test('the bounded legacy menu fallback opens the chooser for the exact fiber session ID', async (t) => {
@@ -968,7 +1283,7 @@ test('dragging an active session displays the backend safety reason without acce
 
   dispatchDrag(app.dom, sourceGroup.sessions[0].row, 'dragstart')
   await flush()
-  assert.match(document.querySelector('[role="alert"]').textContent, /session is still active/i)
+  assert.match(document.querySelector('[role="alert"]').textContent, /session is loaded/i)
   const over = dispatchDrag(app.dom, targetGroup.headerChild, 'dragover')
   assert.equal(over.defaultPrevented, false)
   assert.equal(app.calls.some(call => call.method === 'move'), false)

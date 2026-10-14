@@ -8,7 +8,8 @@ Use either **Move to another workspace** in the session's sidebar menu or drag t
 
 ## Safety
 
-- Only cold sessions with no Host Agent or open write handle can move. In DSH `0.2.0-rc.2`, switching to another session does not close these resources.
+- DSH `0.2.0-rc.2` also supports opened idle sessions: fence new input to that Agent, await its complete Native teardown, move, then resume the same ID. Running, maintenance and queued-input states are refused without cancelling their work.
+- Releasing loaded sessions uses an adapter for this exact version. The Host version, lifecycle label and Agent scope metadata identity must match uniquely; unknown interfaces or ownership are refused. Other versions still require a cold session.
 - The destination must be an existing workspace registered in DSH.
 - Existing destination artifacts are never overwritten.
 - The source revision is checked before commit. A session that changes during preparation is rejected.
@@ -31,7 +32,7 @@ Build and install the checked-out version:
 npm ci
 npm run build
 npm pack
-dsh plugin --profile web add ./dsh-session-workspace-0.2.6.tgz
+dsh plugin --profile web add ./dsh-session-workspace-0.2.7.tgz
 ```
 
 Use `--profile desktop` instead of `--profile web` for the official desktop app.
@@ -46,7 +47,7 @@ The native path supports V3 and V4 JSONL generation and write-lease hooks. V4 us
 
 ## Use
 
-1. Use a cold session with no Host Agent or open write handle. In DSH `0.2.0-rc.2`, switching to another session releases the UI view but keeps the Host Agent and its write handle. After a normal, safe DSH restart, move the session before opening it again.
+1. Wait until the session is idle with no queued input. Opened sessions in DSH `0.2.0-rc.2` do not require an app restart. If the session is currently displayed, its view is temporarily released and reopened at the same ID afterward so the conversation can continue. If you select another session during the move, the plugin leaves your selection in place. An unverifiable or retained view is refused before migration.
 2. Use either entry point:
    - **Menu:** open that session's **⋯** menu, select **Move to another workspace**, choose the destination and confirm.
    - **Drag:** in a workspace-grouped sidebar, drag the session row onto the destination group's folder/title, a session row or blank area within the group. Over a session row, its upper/lower half selects insertion before/after that session; the destination blue line shows the exact position. Wait for the highlight and line, then release. Header and blank-area drops use the default position. A result or refusal is shown in a toast.
@@ -56,6 +57,8 @@ While a valid destination workspace is highlighted, stale native session-reorder
 Positioned drops save the relative anchor through the public workspace ordering API and save the complete display order through DSH's existing shared sidebar Store action. This switches to native manual ordering and retains hidden/archived members and other accounts' order. New/blank and pinned sections retain DSH's fixed layout; an impossible section boundary is rejected before migration. Session IDs, history, pin and archive flags are preserved.
 
 The session remains at the same ID and appears under the destination workspace. Future shell, filesystem, and sandbox operations use the destination workspace path.
+
+The Host has no public single-session close API. The loaded-session adapter invokes only the exact Native `agentLoop.lifecycle(id)` teardown, rather than deleting registry entries or disposing the scope fiber itself. It waits for writer closure and verifies that the Native write lease can be acquired again. The client's `clearMain()` is also an internal compatibility seam for this version; it retires the old history generation, then the public `openSession()` reopens the session. Neither internal seam is a stable API for future DSH versions.
 
 ## Uninstall
 

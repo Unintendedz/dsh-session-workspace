@@ -22,7 +22,8 @@ const zh = {
   'dialog.moving': '正在安全移动…',
   'dialog.moved': '已移动到“{title}”。',
   'drag.moved': '已移动到“{title}”。',
-  'reason.session-active': '这个会话的 Host Agent 或写入句柄仍在使用。请在正常、安全地重启 DSH 后，先移动，再打开该会话。',
+  'reason.session-active': '这个会话仍由 Host Agent 加载，但当前后端不支持安全移动已加载会话。',
+  'reason.session-busy': '这个会话仍有正在运行或排队的工作。请等它空闲后再移动；移动操作不会停止工作。',
   'reason.unsupported': '当前 DSH 版本或持久化后端不支持安全迁移。',
   'reason.no-targets': '没有其他可用工作区。',
   'error.load': '无法读取工作区：{message}',
@@ -32,6 +33,11 @@ const zh = {
   'error.order-boundary': '原生侧栏固定了新会话和置顶分区，这个插入边界无法实现；会话没有移动。',
   'error.position-unsupported': '当前后端不支持会话行间定位；请重新加载本插件后重试，或拖到工作区标题/留白处移动。',
   'error.order-save': '会话已移动，但无法保存侧栏插入位置：{message}',
+  'error.view-unavailable': '无法核实或释放当前会话视图；未发送移动请求。',
+  'error.view-release': '当前会话仍被其他组件保留，未发送移动请求。',
+  'error.view-release-restore': '无法准备当前会话视图：{message}；恢复原会话也失败：{restoreMessage}。未发送移动请求。',
+  'error.move-restore': '移动失败：{moveMessage}；并且无法恢复原会话视图：{restoreMessage}',
+  'error.view-restore': '会话已移动，但无法刷新并重新打开原会话：{message}',
 }
 
 const en = {
@@ -46,7 +52,8 @@ const en = {
   'dialog.moving': 'Moving safely…',
   'dialog.moved': 'Moved to “{title}”.',
   'drag.moved': 'Moved to “{title}”.',
-  'reason.session-active': 'This session still has a Host Agent or open write handle. After a normal, safe DSH restart, move it before opening it again.',
+  'reason.session-active': 'This session still has a loaded Host Agent, and the current backend cannot safely move loaded sessions.',
+  'reason.session-busy': 'This session has running or queued work. Wait until it is idle; moving will not stop that work.',
   'reason.unsupported': 'This DSH version or persistence backend cannot move sessions safely.',
   'reason.no-targets': 'No other workspace is available.',
   'error.load': 'Could not load workspaces: {message}',
@@ -56,14 +63,21 @@ const en = {
   'error.order-boundary': 'The native sidebar keeps new and pinned sessions in fixed sections, so this insertion boundary cannot be honored. The session was not moved.',
   'error.position-unsupported': 'The current backend does not support insertion between session rows. Reload this plugin and try again, or drop on the workspace header or empty area to move the session.',
   'error.order-save': 'The session moved, but its sidebar position could not be saved: {message}',
+  'error.view-unavailable': 'The current session view cannot be verified or released; no move was sent.',
+  'error.view-release': 'Another component still retains this session, so it was not moved.',
+  'error.view-release-restore': 'Could not prepare the current session view: {message}; restoring the original session also failed: {restoreMessage}. No move was sent.',
+  'error.move-restore': 'The move failed: {moveMessage}; the original session view could not be restored: {restoreMessage}',
+  'error.view-restore': 'The session moved, but its view could not be refreshed and reopened: {message}',
 }
 
-export const inject = ['locale', 'connection', 'slots', 'sessions', 'workspaces']
+export const inject = ['locale', 'connection', 'slots', 'sessions', 'workspaces', 'uiWorkspace']
 
 export function workspaceDialogModel(state) {
   const choices = state.workspaces.filter(workspace => workspace.workspaceId !== state.currentWorkspaceId)
-  const reason = state.active
-    ? 'session-active'
+  const reason = state.busy === true
+    ? 'session-busy'
+    : state.active === true && state.warmMoveSupported !== true
+      ? 'session-active'
     : !state.supported
       ? 'unsupported'
       : choices.length === 0 ? 'no-targets' : undefined
@@ -118,6 +132,184 @@ function showToast(message, { error = false, duration = 3000 } = {}) {
   toast.dataset.error = String(error)
   document.body.appendChild(toast)
   setTimeout(() => toast.remove(), duration)
+}
+
+function localizedError(t, key, values) {
+  const error = new Error(t(key, values))
+  error.localUserMessage = true
+  return error
+}
+
+function serviceFromContext(ctx, name) {
+  try {
+    const service = typeof ctx.get === 'function' ? ctx.get(name) : undefined
+    return service ?? ctx[name]
+  } catch {
+    return ctx[name]
+  }
+}
+
+function readMainViewState(ctx, sessionId, t) {
+  const sessions = serviceFromContext(ctx, 'sessions')
+  const snapshot = sessions?.list?.getSnapshot?.()
+  const summary = snapshot?.byId?.[sessionId]
+  const retention = sessions?.retainInfo?.(sessionId)?.getSnapshot?.()
+  if (snapshot?.phase !== 'ready' || snapshot.byId === null || typeof snapshot.byId !== 'object'
+    || summary === undefined
+    || retention === undefined || retention.retainedBy === null || typeof retention.retainedBy !== 'object'
+    || !Number.isSafeInteger(retention.referenceCount) || retention.referenceCount < 0) {
+    throw localizedError(t, 'error.view-unavailable')
+  }
+
+  const retainedMainView = retention.retainedBy.mainView ?? 0
+  if (!Number.isSafeInteger(retainedMainView)) {
+    throw localizedError(t, 'error.view-unavailable')
+  }
+
+  const rows = Object.entries(snapshot.byId)
+  const summariesHaveRetention = rows.every(([, candidate]) =>
+    candidate?.retainedBy !== null && typeof candidate?.retainedBy === 'object')
+  const currentIds = []
+  for (const [id, candidate] of rows) {
+    let mainView = candidate.retainedBy?.mainView ?? 0
+    if (!summariesHaveRetention) {
+      const candidateRetention = sessions.retainInfo?.(id)?.getSnapshot?.()
+      if (candidateRetention?.retainedBy === null || typeof candidateRetention?.retainedBy !== 'object') {
+        throw localizedError(t, 'error.view-unavailable')
+      }
+      mainView = candidateRetention.retainedBy.mainView ?? 0
+    }
+    if (!Number.isSafeInteger(mainView)) throw localizedError(t, 'error.view-unavailable')
+    if (candidate.retainedBy !== undefined && candidate.retainedBy !== null
+      && typeof candidate.retainedBy === 'object'
+      && (candidate.retainedBy.mainView ?? 0) !== mainView) {
+      throw localizedError(t, 'error.view-unavailable')
+    }
+    if (mainView > 0) currentIds.push(id)
+  }
+  const summaryHasRetention = summary.retainedBy !== null && typeof summary.retainedBy === 'object'
+  const summaryMainView = summaryHasRetention ? summary.retainedBy.mainView ?? 0 : retainedMainView
+  if (currentIds.length > 1 || ((retainedMainView > 0) !== (currentIds[0] === sessionId))) {
+    throw localizedError(t, 'error.view-unavailable')
+  }
+  if (!Number.isSafeInteger(summaryMainView) || summaryMainView !== retainedMainView) {
+    throw localizedError(t, 'error.view-unavailable')
+  }
+
+  return {
+    sessions,
+    retention,
+    currentSessionId: currentIds[0],
+  }
+}
+
+function requireMainViewRelease(ctx, sessionId, state, t) {
+  if (state.sessionId !== sessionId) throw localizedError(t, 'error.view-unavailable')
+  const before = readMainViewState(ctx, sessionId, t)
+  if (typeof before.sessions.refresh !== 'function') {
+    throw localizedError(t, 'error.view-unavailable')
+  }
+  if (before.currentSessionId !== sessionId) {
+    return { ...before, sessionId, wasCurrent: false }
+  }
+
+  if (state.warmMoveSupported !== true) {
+    throw localizedError(t, 'error.view-unavailable')
+  }
+
+  const uiWorkspace = serviceFromContext(ctx, 'uiWorkspace')
+  if (typeof uiWorkspace?.clearMain !== 'function'
+    || typeof uiWorkspace?.openSession !== 'function') {
+    throw localizedError(t, 'error.view-unavailable')
+  }
+
+  // DSH 0.2.0-rc.2 documents openSession but not clearMain. This version-limited
+  // bridge uses that exact Native method and fails closed if a future version
+  // removes it; it never reaches into React state or private storage.
+  return { ...before, uiWorkspace, sessionId, wasCurrent: true }
+}
+
+function mainViewIsVacant(ctx, sessionId, t) {
+  return readMainViewState(ctx, sessionId, t).currentSessionId === undefined
+}
+
+function restoreMainSessionIfVacant(ctx, release, t) {
+  if (!release.wasCurrent) return undefined
+  try {
+    if (!mainViewIsVacant(ctx, release.sessionId, t)) return undefined
+    release.uiWorkspace.openSession(release.sessionId)
+    const restored = readMainViewState(ctx, release.sessionId, t)
+    if (restored.currentSessionId !== release.sessionId) throw localizedError(t, 'error.view-unavailable')
+    return undefined
+  } catch (error) {
+    return error
+  }
+}
+
+async function moveSessionSafely(ctx, t, state, workspaceId, position, afterCommit) {
+  const model = workspaceDialogModel(state)
+  if (!model.canMove) throw localizedError(t, `reason.${model.reason ?? 'unsupported'}`)
+
+  const release = requireMainViewRelease(ctx, state.sessionId, state, t)
+  if (release.wasCurrent) {
+    try {
+      release.uiWorkspace.clearMain()
+      const afterRelease = readMainViewState(ctx, state.sessionId, t)
+      if (afterRelease.currentSessionId !== undefined || afterRelease.retention.referenceCount !== 0) {
+        throw localizedError(t, 'error.view-release')
+      }
+    } catch (error) {
+      const restoreError = restoreMainSessionIfVacant(ctx, release, t)
+      if (restoreError !== undefined) {
+        throw localizedError(t, 'error.view-release-restore', {
+          message: error instanceof Error ? error.message : String(error),
+          restoreMessage: restoreError instanceof Error ? restoreError.message : String(restoreError),
+        })
+      }
+      throw error
+    }
+  }
+
+  let result
+  try {
+    result = await ctx.connection.rpc.call(RPC_PATH, 'move', {
+      sessionId: state.sessionId,
+      workspaceId,
+      ...(position === undefined ? {} : { position }),
+    })
+    if (!result?.ok) throw new Error(resultError(result))
+  } catch (error) {
+    const restoreError = restoreMainSessionIfVacant(ctx, release, t)
+    if (restoreError !== undefined) {
+      throw localizedError(t, 'error.move-restore', {
+        moveMessage: error instanceof Error ? error.message : String(error),
+        restoreMessage: restoreError instanceof Error ? restoreError.message : String(restoreError),
+      })
+    }
+    throw error
+  }
+
+  let postMoveError
+  try {
+    await afterCommit?.()
+  } catch (error) {
+    postMoveError = error
+  }
+  try {
+    await release.sessions.refresh()
+  } catch (error) {
+    postMoveError ??= error
+  }
+  const restoreError = restoreMainSessionIfVacant(ctx, release, t)
+  postMoveError ??= restoreError
+  if (postMoveError !== undefined) {
+    if (postMoveError.localUserMessage === true) throw postMoveError
+    const message = postMoveError instanceof Error ? postMoveError.message : String(postMoveError)
+    const error = localizedError(t, afterCommit === undefined ? 'error.view-restore' : 'error.order-save', { message })
+    error.moved = true
+    throw error
+  }
+  return result.value
 }
 
 function openDialog(ctx, anchor, sessionId, state, t) {
@@ -212,11 +404,7 @@ function openDialog(ctx, anchor, sessionId, state, t) {
     status.textContent = t('dialog.moving')
     const workspace = model.choices.find(choice => choice.workspaceId === select.value)
     try {
-      const result = await ctx.connection.rpc.call(RPC_PATH, 'move', {
-        sessionId,
-        workspaceId: select.value,
-      })
-      if (!result?.ok) throw new Error(resultError(result))
+      await moveSessionSafely(ctx, t, state, select.value)
       status.textContent = t('dialog.moved', { title: workspace?.title ?? select.value })
       busy = false
       setTimeout(close, 700)
@@ -226,7 +414,9 @@ function openDialog(ctx, anchor, sessionId, state, t) {
       cancel.disabled = false
       confirm.disabled = false
       status.dataset.error = 'true'
-      status.textContent = t('error.move', { message: error instanceof Error ? error.message : String(error) })
+      status.textContent = error?.localUserMessage === true
+        ? error.message
+        : t('error.move', { message: error instanceof Error ? error.message : String(error) })
       select.focus()
     } finally {
       movingSessions.delete(sessionId)
@@ -855,22 +1045,23 @@ function installSessionDragAndDrop(ctx, t) {
         return
       }
       movingSessions.add(current.sessionId)
-      let moved = false
       try {
-        const result = await ctx.connection.rpc.call(RPC_PATH, 'move', {
-          sessionId: current.sessionId,
+        await moveSessionSafely(
+          ctx,
+          t,
+          resolvedState,
           workspaceId,
-          ...(orderPlan === undefined ? {} : { position: { anchorSessionId: orderPlan.pointerPosition.anchorSessionId, side: orderPlan.pointerPosition.side } }),
-        })
-        if (!result?.ok) throw new Error(resultError(result))
-        moved = true
-        if (orderPlan !== undefined) {
-          await orderPlan.view.actions.setSessionOrder(orderPlan.targetWorkspaceId, orderPlan.nextOrder, orderPlan.initialOrders)
-        }
+          orderPlan === undefined
+            ? undefined
+            : { anchorSessionId: orderPlan.pointerPosition.anchorSessionId, side: orderPlan.pointerPosition.side },
+          orderPlan === undefined
+            ? undefined
+            : () => orderPlan.view.actions.setSessionOrder(orderPlan.targetWorkspaceId, orderPlan.nextOrder, orderPlan.initialOrders),
+        )
         showToast(t('drag.moved', { title: workspace?.title ?? workspaceId }), { duration: 2200 })
       } catch (error) {
-        const message = error instanceof Error ? error.message : String(error)
-        showToast(t(moved ? 'error.order-save' : 'error.move', { message }), { error: true })
+        if (error?.localUserMessage === true) showToast(error.message, { error: true })
+        else showToast(t('error.move', { message: error instanceof Error ? error.message : String(error) }), { error: true })
       } finally {
         movingSessions.delete(current.sessionId)
       }

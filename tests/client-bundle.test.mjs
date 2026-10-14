@@ -23,7 +23,7 @@ test('published browser entry registers its factory with the DSH ModuleLoader', 
       throw new Error(`unexpected browser external: ${specifier}`)
     })
     assert.equal(typeof exports.apply, 'function')
-    assert.deepEqual(Array.from(exports.inject), ['locale', 'connection', 'slots', 'sessions', 'workspaces'])
+    assert.deepEqual(Array.from(exports.inject), ['locale', 'connection', 'slots', 'sessions', 'workspaces', 'uiWorkspace'])
   } finally {
     if (previousWindow === undefined) delete globalThis.window
     else globalThis.window = previousWindow

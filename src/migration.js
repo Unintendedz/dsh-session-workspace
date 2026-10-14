@@ -4,6 +4,7 @@ import { copyFile, link, mkdir, open, readFile, readdir, rename, stat, unlink } 
 import { basename, dirname, isAbsolute, join } from 'node:path'
 import { promisify } from 'node:util'
 import { constants as zlibConstants, zstdCompress, zstdDecompress } from 'node:zlib'
+import { inspectLiveSession, releaseLiveSession, LiveSessionError } from './live-session.js'
 
 const zstdCompressAsync = promisify(zstdCompress)
 const zstdDecompressAsync = promisify(zstdDecompress)
@@ -386,9 +387,6 @@ export async function moveSessionWorkspace(ctx, payload, options = {}) {
 
   let temporary
   try {
-    if (ctx.sessions.get(sessionId) !== undefined || ctx.agents.get(sessionId) !== undefined) {
-      fail('session-active', `session ${JSON.stringify(sessionId)} is active; close it before moving it`)
-    }
     const target = ctx.workspaceRegistry.get(workspaceId)
     if (target === undefined) fail('workspace-not-found', `workspace ${JSON.stringify(workspaceId)} was not found`)
     if (typeof ctx.workspaceRegistry.replaceHeaderIndex !== 'function') {
@@ -404,6 +402,18 @@ export async function moveSessionWorkspace(ctx, payload, options = {}) {
     const beforeSessionId = targetInsertionAnchor(target, sessionId, position)
     if (position !== undefined && typeof target.insertSessionBefore !== 'function') {
       fail('unsupported-dsh-version', 'this DSH build does not expose durable workspace session ordering')
+    }
+
+    if (ctx.sessions.get(sessionId) !== undefined || ctx.agents.get(sessionId) !== undefined) {
+      const liveState = await inspectLiveSession(ctx, sessionId)
+      if (liveState.busy) fail('session-busy', 'wait for this session to finish its current work and pending input before moving it')
+      if (!liveState.canRelease) fail('session-active', 'this DSH runtime cannot safely release the loaded session')
+      try {
+        await releaseLiveSession(ctx, sessionId)
+      } catch (error) {
+        if (error instanceof LiveSessionError) fail(error.code, error.message)
+        throw error
+      }
     }
 
     if (supportsNativeWorkspaceMove(ctx.sessionPersistence)) {

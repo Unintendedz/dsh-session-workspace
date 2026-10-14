@@ -44,6 +44,8 @@ test('sessionWorkspaceState reports the current workspace and active safety gate
     currentWorkspaceId: 'old',
     currentPath: '/projects/old',
     active: true,
+    busy: false,
+    warmMoveSupported: false,
     supported: true,
     positionSupported: false,
     workspaces: [
