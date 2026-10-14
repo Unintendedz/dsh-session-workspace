@@ -118,6 +118,47 @@ function dispatchDrag(dom, target, type, dataTransfer = { dropEffect: 'none' }) 
   return event
 }
 
+function createWorkspaceTree() {
+  const tree = document.createElement('div')
+  tree.setAttribute('role', 'tree')
+  document.body.append(tree)
+  return tree
+}
+
+function makeWorkspaceGroup(workspaceId, sessionIds = []) {
+  const container = document.createElement('div')
+  const headerWrapper = document.createElement('span')
+  const header = document.createElement('div')
+  header.dataset.rowKey = `workspace:${workspaceId}`
+  header.setAttribute('role', 'treeitem')
+  const headerChild = document.createElement('span')
+  header.append(headerChild)
+  headerWrapper.append(header)
+  container.append(headerWrapper)
+
+  const sessions = sessionIds.map((sessionId) => {
+    const rowWrapper = document.createElement('span')
+    const row = document.createElement('div')
+    row.dataset.rowKey = `session:${sessionId}`
+    row.setAttribute('role', 'treeitem')
+    const child = document.createElement('span')
+    row.append(child)
+    rowWrapper.append(row)
+    container.append(rowWrapper)
+    return { row, child, rowWrapper }
+  })
+
+  const padding = document.createElement('div')
+  container.append(padding)
+  return { container, header, headerChild, sessions, padding }
+}
+
+function addWorkspaceGroup(tree, workspaceId, sessionIds = []) {
+  const group = makeWorkspaceGroup(workspaceId, sessionIds)
+  tree.append(group.container)
+  return group
+}
+
 async function flush() {
   await new Promise(resolve => setImmediate(resolve))
 }
@@ -254,28 +295,26 @@ test('a modern test context without snapshot defaults to the slot path, never th
 test('dragging a session row onto a different workspace moves once and reports the result', async (t) => {
   const app = setup()
   t.after(() => app.teardown())
-  const source = document.createElement('div')
-  source.dataset.rowKey = 'session:session-one'
-  const workspace = document.createElement('div')
-  workspace.dataset.rowKey = 'workspace:new'
-  const workspaceChild = document.createElement('span')
-  workspace.append(workspaceChild)
-  document.body.append(source, workspace)
+  const tree = createWorkspaceTree()
+  const sourceGroup = addWorkspaceGroup(tree, 'old', ['session-one'])
+  const targetGroup = addWorkspaceGroup(tree, 'new')
   let hostWorkspaceDragOver = false
-  workspace.addEventListener('dragover', () => { hostWorkspaceDragOver = true })
+  targetGroup.header.addEventListener('dragover', () => { hostWorkspaceDragOver = true })
 
-  dispatchDrag(app.dom, source, 'dragstart')
+  dispatchDrag(app.dom, sourceGroup.sessions[0].row, 'dragstart')
   await flush()
   const dataTransfer = { dropEffect: 'none' }
-  const over = dispatchDrag(app.dom, workspaceChild, 'dragover', dataTransfer)
+  const over = dispatchDrag(app.dom, targetGroup.headerChild, 'dragover', dataTransfer)
   assert.equal(over.defaultPrevented, true)
   assert.equal(dataTransfer.dropEffect, 'move')
   assert.equal(hostWorkspaceDragOver, false, 'the workspace reorder handler must not receive a session drop')
-  assert.equal(workspace.getAttribute('data-dsw-drop-target'), 'true')
+  assert.equal(targetGroup.container.getAttribute('data-dsw-drop-target'), 'true', 'the entire target group is highlighted')
+  assert.equal(targetGroup.header.parentElement.hasAttribute('data-dsw-drop-target'), false, 'the transparent header wrapper is not highlighted as the whole target')
+  assert.equal(tree.hasAttribute('data-dsw-drop-target'), false, 'highlighting does not escape the selected group to the tree root')
 
-  const drop = dispatchDrag(app.dom, workspaceChild, 'drop', dataTransfer)
+  const drop = dispatchDrag(app.dom, targetGroup.headerChild, 'drop', dataTransfer)
   assert.equal(drop.defaultPrevented, true)
-  dispatchDrag(app.dom, workspaceChild, 'drop', dataTransfer)
+  dispatchDrag(app.dom, targetGroup.headerChild, 'drop', dataTransfer)
   await flush()
   assert.deepEqual(app.calls.filter(call => call.method === 'move').map(call => call.payload), [
     { sessionId: 'session-one', workspaceId: 'new' },
@@ -283,38 +322,156 @@ test('dragging a session row onto a different workspace moves once and reports t
   assert.match(document.querySelector('[role="status"]').textContent, /Moved to “New”/)
 })
 
+test('cross-workspace drops from target session content or group padding resolve to that group', async (t) => {
+  const app = setup({ sessionState: state({
+    workspaces: [
+      { workspaceId: 'old', title: 'Old', path: '/projects/old' },
+      { workspaceId: 'new', title: 'New', path: '/projects/new' },
+      { workspaceId: 'empty', title: 'Empty', path: '/projects/empty' },
+    ],
+  }) })
+  t.after(() => app.teardown())
+  const tree = createWorkspaceTree()
+  const sourceGroup = addWorkspaceGroup(tree, 'old', ['session-one'])
+  const targetGroup = addWorkspaceGroup(tree, 'new', ['target-first', 'target-second'])
+  const collapsedTarget = makeWorkspaceGroup('empty')
+  const overflow = document.createElement('button')
+  overflow.dataset.rowKey = 'overflow:empty'
+  collapsedTarget.container.append(overflow)
+  tree.append(collapsedTarget.container)
+
+  dispatchDrag(app.dom, sourceGroup.sessions[0].row, 'dragstart')
+  await flush()
+  const sessionOver = dispatchDrag(app.dom, targetGroup.sessions[0].child, 'dragover')
+  assert.equal(sessionOver.defaultPrevented, true)
+  assert.equal(targetGroup.container.getAttribute('data-dsw-drop-target'), 'true')
+  const sessionDrop = dispatchDrag(app.dom, targetGroup.sessions[1].child, 'drop')
+  assert.equal(sessionDrop.defaultPrevented, true)
+  assert.equal(targetGroup.container.hasAttribute('data-dsw-drop-target'), false)
+  await flush()
+  assert.deepEqual(app.calls.filter(call => call.method === 'move').map(call => call.payload), [
+    { sessionId: 'session-one', workspaceId: 'new' },
+  ])
+  dispatchDrag(app.dom, sourceGroup.sessions[0].row, 'dragend')
+
+  dispatchDrag(app.dom, sourceGroup.sessions[0].row, 'dragstart')
+  await flush()
+  const paddingOver = dispatchDrag(app.dom, targetGroup.padding, 'dragover')
+  assert.equal(paddingOver.defaultPrevented, true)
+  assert.equal(targetGroup.container.getAttribute('data-dsw-drop-target'), 'true')
+  const paddingDrop = dispatchDrag(app.dom, targetGroup.padding, 'drop')
+  assert.equal(paddingDrop.defaultPrevented, true)
+  assert.equal(targetGroup.container.hasAttribute('data-dsw-drop-target'), false)
+  await flush()
+  assert.deepEqual(app.calls.filter(call => call.method === 'move').map(call => call.payload), [
+    { sessionId: 'session-one', workspaceId: 'new' },
+    { sessionId: 'session-one', workspaceId: 'new' },
+  ])
+
+  dispatchDrag(app.dom, sourceGroup.sessions[0].row, 'dragstart')
+  await flush()
+  assert.equal(dispatchDrag(app.dom, collapsedTarget.padding, 'dragover').defaultPrevented, true)
+  assert.equal(collapsedTarget.container.getAttribute('data-dsw-drop-target'), 'true')
+  dispatchDrag(app.dom, collapsedTarget.padding, 'drop')
+  await flush()
+  assert.equal(app.calls.filter(call => call.method === 'move').at(-1).payload.workspaceId, 'empty',
+    'a collapsed/empty group resolves its own header through the transparent wrapper')
+})
+
+test('workspace target resolution stays inside its public tree and does not infer a root target', async (t) => {
+  const app = setup()
+  t.after(() => app.teardown())
+  const tree = createWorkspaceTree()
+  const sourceGroup = addWorkspaceGroup(tree, 'old', ['session-one'])
+  const otherTree = createWorkspaceTree()
+  const otherGroup = addWorkspaceGroup(otherTree, 'remote', ['remote-session'])
+  const rootPadding = document.createElement('div')
+  tree.append(rootPadding)
+
+  dispatchDrag(app.dom, sourceGroup.sessions[0].row, 'dragstart')
+  await flush()
+  const crossTree = dispatchDrag(app.dom, otherGroup.sessions[0].child, 'dragover')
+  assert.equal(crossTree.defaultPrevented, false)
+  assert.equal(otherGroup.container.hasAttribute('data-dsw-drop-target'), false)
+  const rootArea = dispatchDrag(app.dom, rootPadding, 'dragover')
+  assert.equal(rootArea.defaultPrevented, false, 'the tree root does not fall back to its first workspace header')
+  assert.equal(sourceGroup.container.hasAttribute('data-dsw-drop-target'), false)
+  assert.equal(app.calls.some(call => call.method === 'move'), false)
+})
+
+test('nested workspace content resolves to its own header and flat-list rows are not workspace targets', async (t) => {
+  const app = setup({ sessionState: state({
+    workspaces: [
+      { workspaceId: 'old', title: 'Old', path: '/projects/old' },
+      { workspaceId: 'new', title: 'New', path: '/projects/new' },
+      { workspaceId: 'parent', title: 'Parent', path: '/projects/parent' },
+      { workspaceId: 'nested', title: 'Nested', path: '/projects/parent/nested' },
+    ],
+  }) })
+  t.after(() => app.teardown())
+  const tree = createWorkspaceTree()
+  const sourceGroup = addWorkspaceGroup(tree, 'old', ['session-one'])
+  const parentGroup = makeWorkspaceGroup('parent')
+  const nestedGroup = makeWorkspaceGroup('nested', ['nested-session'])
+  const nestedRows = document.createElement('div')
+  nestedRows.setAttribute('role', 'group')
+  nestedRows.append(nestedGroup.container)
+  parentGroup.container.insertBefore(nestedRows, parentGroup.padding)
+  tree.append(parentGroup.container)
+
+  dispatchDrag(app.dom, sourceGroup.sessions[0].row, 'dragstart')
+  await flush()
+  const nestedOver = dispatchDrag(app.dom, nestedGroup.sessions[0].child, 'dragover')
+  assert.equal(nestedOver.defaultPrevented, true)
+  assert.equal(nestedGroup.container.getAttribute('data-dsw-drop-target'), 'true')
+  assert.equal(parentGroup.container.hasAttribute('data-dsw-drop-target'), false, 'a nested role=group branch does not inherit its parent workspace')
+  dispatchDrag(app.dom, nestedGroup.sessions[0].child, 'drop')
+  await flush()
+  assert.equal(app.calls.filter(call => call.method === 'move').at(-1).payload.workspaceId, 'nested')
+  dispatchDrag(app.dom, sourceGroup.sessions[0].row, 'dragend')
+
+  const flatTree = createWorkspaceTree()
+  const flatSource = document.createElement('div')
+  flatSource.dataset.rowKey = 'session:flat-source'
+  flatSource.setAttribute('role', 'treeitem')
+  const flatSourceWrapper = document.createElement('span')
+  flatSourceWrapper.append(flatSource)
+  const flatTarget = document.createElement('div')
+  flatTarget.dataset.rowKey = 'session:flat-target'
+  flatTarget.setAttribute('role', 'treeitem')
+  const flatTargetChild = document.createElement('span')
+  flatTarget.append(flatTargetChild)
+  const flatTargetWrapper = document.createElement('span')
+  flatTargetWrapper.append(flatTarget)
+  flatTree.append(flatSourceWrapper, flatTargetWrapper)
+
+  dispatchDrag(app.dom, flatSource, 'dragstart')
+  await flush()
+  const flatOver = dispatchDrag(app.dom, flatTargetChild, 'dragover')
+  assert.equal(flatOver.defaultPrevented, false, 'flat session rows without a workspace sibling stay with native reorder')
+  assert.equal(app.calls.filter(call => call.method === 'move').length, 1)
+})
+
 test('cross-workspace targeting hides the source reorder marker only for the accepted target and cleans up', async (t) => {
   const app = setup()
   let disposed = false
   t.after(() => { if (!disposed) app.teardown() })
 
-  const tree = document.createElement('div')
-  tree.setAttribute('role', 'tree')
-  const source = document.createElement('div')
-  source.dataset.rowKey = 'session:session-one'
+  const tree = createWorkspaceTree()
+  const sourceWorkspace = addWorkspaceGroup(tree, 'old', ['session-one', 'source-warm-row'])
+  const targetWorkspace = addWorkspaceGroup(tree, 'new', ['target-session'])
+  const source = sourceWorkspace.sessions[0].row
+  const siblingMarker = sourceWorkspace.sessions[1].row
   source.className = 'host-session-row host-drop-before host-drop-after'
-  const siblingMarker = document.createElement('div')
-  siblingMarker.dataset.rowKey = 'session:source-warm-row'
   siblingMarker.className = 'host-session-row host-drop-before'
-  const sourceWorkspace = document.createElement('div')
-  sourceWorkspace.dataset.rowKey = 'workspace:old'
-  const sourceWorkspaceChild = document.createElement('span')
-  sourceWorkspace.append(sourceWorkspaceChild)
-  const targetWorkspace = document.createElement('div')
-  targetWorkspace.dataset.rowKey = 'workspace:new'
-  const targetWorkspaceChild = document.createElement('span')
-  targetWorkspace.append(targetWorkspaceChild)
   const outside = document.createElement('div')
-  tree.append(source, siblingMarker, sourceWorkspace, targetWorkspace)
-  const otherTree = document.createElement('div')
-  otherTree.setAttribute('role', 'tree')
-  const unrelatedSession = document.createElement('div')
-  unrelatedSession.dataset.rowKey = 'session:unrelated'
-  otherTree.append(unrelatedSession)
-  document.body.append(tree, outside, otherTree)
+  document.body.append(outside)
+  const otherTree = createWorkspaceTree()
+  const unrelated = addWorkspaceGroup(otherTree, 'unrelated', ['unrelated-session'])
+  const unrelatedSession = unrelated.sessions[0].row
 
   let sourceWorkspaceDragOver = false
-  sourceWorkspace.addEventListener('dragover', () => { sourceWorkspaceDragOver = true })
+  sourceWorkspace.header.addEventListener('dragover', () => { sourceWorkspaceDragOver = true })
   const activeTreeSelector = '[role="tree"][data-dsw-cross-workspace-drop-active="true"]'
   const hiddenMarkerSelector = `${activeTreeSelector} [data-row-key^="session:"]`
   const styles = document.getElementById('dsh-session-workspace-style').textContent
@@ -323,29 +480,29 @@ test('cross-workspace targeting hides the source reorder marker only for the acc
 
   dispatchDrag(app.dom, source, 'dragstart')
   await flush()
-  dispatchDrag(app.dom, targetWorkspaceChild, 'dragover')
+  dispatchDrag(app.dom, targetWorkspace.sessions[0].child, 'dragover')
   assert.equal(tree.getAttribute('data-dsw-cross-workspace-drop-active'), 'true')
-  assert.deepEqual(Array.from(document.querySelectorAll(hiddenMarkerSelector)), [source, siblingMarker],
-    'the tree-scoped override also matches the SDK marker row beside the dragged source')
+  assert.deepEqual(Array.from(document.querySelectorAll(hiddenMarkerSelector)), [source, siblingMarker, targetWorkspace.sessions[0].row],
+    'the tree-scoped override also matches the sibling source marker row and target-group session rows')
   assert.equal(source.classList.contains('host-drop-after'), true)
   assert.equal(siblingMarker.classList.contains('host-drop-before'), true, 'host marker classes remain intact while the scoped CSS hides both marker rows')
   assert.equal(unrelatedSession.matches(hiddenMarkerSelector), false, 'other sidebar trees are not hidden')
-  assert.equal(targetWorkspace.getAttribute('data-dsw-drop-target'), 'true')
+  assert.equal(targetWorkspace.container.getAttribute('data-dsw-drop-target'), 'true')
 
-  const backToSource = dispatchDrag(app.dom, sourceWorkspaceChild, 'dragover')
+  const backToSource = dispatchDrag(app.dom, sourceWorkspace.headerChild, 'dragover')
   assert.equal(tree.hasAttribute('data-dsw-cross-workspace-drop-active'), false)
   assert.equal(backToSource.defaultPrevented, false)
   assert.equal(sourceWorkspaceDragOver, true, 'returning to Source leaves host drag handling enabled')
   assert.equal(source.classList.contains('host-drop-after'), true)
   assert.equal(siblingMarker.classList.contains('host-drop-before'), true)
-  assert.equal(targetWorkspace.hasAttribute('data-dsw-drop-target'), false)
+  assert.equal(targetWorkspace.container.hasAttribute('data-dsw-drop-target'), false)
 
-  dispatchDrag(app.dom, targetWorkspaceChild, 'dragover')
+  dispatchDrag(app.dom, targetWorkspace.sessions[0].child, 'dragover')
   assert.equal(tree.getAttribute('data-dsw-cross-workspace-drop-active'), 'true')
   dispatchDrag(app.dom, outside, 'dragover')
   assert.equal(tree.hasAttribute('data-dsw-cross-workspace-drop-active'), false, 'leaving the target restores the native marker')
 
-  dispatchDrag(app.dom, targetWorkspaceChild, 'dragover')
+  dispatchDrag(app.dom, targetWorkspace.sessions[0].child, 'dragover')
   assert.equal(tree.getAttribute('data-dsw-cross-workspace-drop-active'), 'true')
   dispatchDrag(app.dom, source, 'dragend')
   assert.equal(tree.hasAttribute('data-dsw-cross-workspace-drop-active'), false)
@@ -354,7 +511,7 @@ test('cross-workspace targeting hides the source reorder marker only for the acc
 
   dispatchDrag(app.dom, source, 'dragstart')
   await flush()
-  dispatchDrag(app.dom, targetWorkspaceChild, 'dragover')
+  dispatchDrag(app.dom, targetWorkspace.sessions[0].child, 'dragover')
   assert.equal(tree.getAttribute('data-dsw-cross-workspace-drop-active'), 'true')
   app.teardown()
   disposed = true
@@ -366,16 +523,14 @@ test('cross-workspace targeting hides the source reorder marker only for the acc
 test('dragging an active session displays the backend safety reason without accepting a drop', async (t) => {
   const app = setup({ sessionState: state({ active: true }) })
   t.after(() => app.teardown())
-  const source = document.createElement('div')
-  source.dataset.rowKey = 'session:session-one'
-  const target = document.createElement('div')
-  target.dataset.rowKey = 'workspace:new'
-  document.body.append(source, target)
+  const tree = createWorkspaceTree()
+  const sourceGroup = addWorkspaceGroup(tree, 'old', ['session-one'])
+  const targetGroup = addWorkspaceGroup(tree, 'new')
 
-  dispatchDrag(app.dom, source, 'dragstart')
+  dispatchDrag(app.dom, sourceGroup.sessions[0].row, 'dragstart')
   await flush()
   assert.match(document.querySelector('[role="alert"]').textContent, /session is still active/i)
-  const over = dispatchDrag(app.dom, target, 'dragover')
+  const over = dispatchDrag(app.dom, targetGroup.headerChild, 'dragover')
   assert.equal(over.defaultPrevented, false)
   assert.equal(app.calls.some(call => call.method === 'move'), false)
 })
@@ -383,16 +538,14 @@ test('dragging an active session displays the backend safety reason without acce
 test('a backend rejection after a drag is shown as a visible move error', async (t) => {
   const app = setup({ moveResult: { ok: false, error: { code: 'session-active', message: 'session became active' } } })
   t.after(() => app.teardown())
-  const source = document.createElement('div')
-  source.dataset.rowKey = 'session:session-one'
-  const target = document.createElement('div')
-  target.dataset.rowKey = 'workspace:new'
-  document.body.append(source, target)
+  const tree = createWorkspaceTree()
+  const sourceGroup = addWorkspaceGroup(tree, 'old', ['session-one'])
+  const targetGroup = addWorkspaceGroup(tree, 'new')
 
-  dispatchDrag(app.dom, source, 'dragstart')
+  dispatchDrag(app.dom, sourceGroup.sessions[0].row, 'dragstart')
   await flush()
-  dispatchDrag(app.dom, target, 'dragover')
-  dispatchDrag(app.dom, target, 'drop')
+  dispatchDrag(app.dom, targetGroup.headerChild, 'dragover')
+  dispatchDrag(app.dom, targetGroup.headerChild, 'drop')
   await flush()
   assert.match(document.querySelector('[role="alert"]').textContent, /session became active/)
 })
@@ -400,41 +553,47 @@ test('a backend rejection after a drag is shown as a visible move error', async 
 test('same-workspace reorder and workspace-row drag are left to the host', async (t) => {
   const app = setup()
   t.after(() => app.teardown())
-  const session = document.createElement('div')
-  session.dataset.rowKey = 'session:session-one'
-  const sameWorkspace = document.createElement('div')
-  sameWorkspace.dataset.rowKey = 'workspace:old'
-  const otherSession = document.createElement('div')
-  otherSession.dataset.rowKey = 'session:session-two'
-  const workspaceSource = document.createElement('div')
-  workspaceSource.dataset.rowKey = 'workspace:old'
-  const workspaceTarget = document.createElement('div')
-  workspaceTarget.dataset.rowKey = 'workspace:new'
-  document.body.append(session, sameWorkspace, otherSession, workspaceSource, workspaceTarget)
+  const tree = createWorkspaceTree()
+  const sourceGroup = addWorkspaceGroup(tree, 'old', ['session-one', 'session-two'])
+  const targetGroup = addWorkspaceGroup(tree, 'new')
+  let hostSessionDragOver = false
+  sourceGroup.sessions[1].row.addEventListener('dragover', () => { hostSessionDragOver = true })
 
-  dispatchDrag(app.dom, session, 'dragstart')
+  dispatchDrag(app.dom, sourceGroup.sessions[0].row, 'dragstart')
   await flush()
-  assert.equal(dispatchDrag(app.dom, sameWorkspace, 'dragover').defaultPrevented, false)
-  assert.equal(dispatchDrag(app.dom, otherSession, 'drop').defaultPrevented, false)
-  dispatchDrag(app.dom, session, 'dragend')
+  assert.equal(dispatchDrag(app.dom, sourceGroup.sessions[0].child, 'dragover').defaultPrevented, false)
+  const sameWorkspaceOver = dispatchDrag(app.dom, sourceGroup.sessions[1].child, 'dragover')
+  assert.equal(sameWorkspaceOver.defaultPrevented, false)
+  assert.equal(hostSessionDragOver, true, 'same-workspace session drag stays available to the host')
+  assert.equal(dispatchDrag(app.dom, sourceGroup.sessions[1].child, 'drop').defaultPrevented, false)
+  dispatchDrag(app.dom, sourceGroup.sessions[0].row, 'dragend')
+
+  hostSessionDragOver = false
+  dispatchDrag(app.dom, sourceGroup.sessions[0].row, 'dragstart')
+  const pendingSameWorkspaceOver = dispatchDrag(app.dom, sourceGroup.sessions[1].child, 'dragover')
+  assert.equal(pendingSameWorkspaceOver.defaultPrevented, false, 'same-workspace reorder remains native while state RPC is pending')
+  assert.equal(hostSessionDragOver, true)
+  assert.equal(dispatchDrag(app.dom, sourceGroup.sessions[1].child, 'drop').defaultPrevented, false)
+  await flush()
+  assert.equal(app.calls.some(call => call.method === 'move'), false)
+  dispatchDrag(app.dom, sourceGroup.sessions[0].row, 'dragend')
 
   const callsBeforeWorkspaceDrag = app.calls.length
-  dispatchDrag(app.dom, workspaceSource, 'dragstart')
+  dispatchDrag(app.dom, sourceGroup.header, 'dragstart')
   assert.equal(app.calls.length, callsBeforeWorkspaceDrag)
-  assert.equal(dispatchDrag(app.dom, workspaceTarget, 'dragover').defaultPrevented, false)
+  assert.equal(dispatchDrag(app.dom, targetGroup.headerChild, 'dragover').defaultPrevented, false)
   assert.equal(app.calls.some(call => call.method === 'move'), false)
 })
 
 test('apply cleanup removes slot registration, styles, and global drag handlers', () => {
   const app = setup()
   const localDocument = app.dom.window.document
-  const source = document.createElement('div')
-  source.dataset.rowKey = 'session:session-one'
-  document.body.append(source)
+  const tree = createWorkspaceTree()
+  const sourceGroup = addWorkspaceGroup(tree, 'old', ['session-one'])
   const before = app.calls.length
   const cleaned = app.teardown()
   assert.deepEqual(cleaned, { registrationRemoved: true, localeRemoved: true })
   assert.equal(localDocument.getElementById('dsh-session-workspace-style'), null)
-  dispatchDrag(app.dom, source, 'dragstart')
+  dispatchDrag(app.dom, sourceGroup.sessions[0].row, 'dragstart')
   assert.equal(app.calls.length, before)
 })

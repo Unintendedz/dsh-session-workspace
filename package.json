@@ -1,6 +1,6 @@
 {
   "name": "dsh-session-workspace",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "description": "Move cold DeepSeek Harness sessions between registered workspaces",
   "main": "src/index.js",
   "scripts": {

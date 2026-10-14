@@ -4,7 +4,7 @@ English | [中文](./README.zh.md)
 
 Move an existing DeepSeek Harness session to another registered workspace without changing its session ID or conversation history.
 
-Use either **Move to another workspace** in the session's sidebar menu or drag the session row onto another workspace's folder/title row. Both entry points use the same authenticated migration handler. The session ID and complete event history are retained; the persisted `cwd` and workspace account change. Older generation files are retained in the backup outside the indexed session root.
+Use either **Move to another workspace** in the session's sidebar menu or drag the session row into another workspace's sidebar group. The destination includes its folder/title row, session rows and the blank area inside that group. Both entry points use the same authenticated migration handler. The session ID and complete event history are retained; the persisted `cwd` and workspace account change. Older generation files are retained in the backup outside the indexed session root.
 
 ## Safety
 
@@ -31,7 +31,7 @@ Build and install the checked-out version:
 npm ci
 npm run build
 npm pack
-dsh plugin --profile web add ./dsh-session-workspace-0.2.3.tgz
+dsh plugin --profile web add ./dsh-session-workspace-0.2.4.tgz
 ```
 
 Use `--profile desktop` instead of `--profile web` for the official desktop app.
@@ -47,7 +47,7 @@ Install the built archive and reload its profile. The native path supports V3 an
 1. Use a cold session with no Host Agent or open write handle. In DSH `0.2.0-rc.2`, switching to another session releases the UI view but keeps the Host Agent and its write handle. After a normal, safe DSH restart, move the session before opening it again.
 2. Use either entry point:
    - **Menu:** open that session's **⋯** menu, select **Move to another workspace**, choose the destination and confirm.
-   - **Drag:** in a workspace-grouped sidebar, drag the session row onto the destination workspace's folder/title row, wait for its highlight, and release. A result or refusal is shown in a toast.
+   - **Drag:** in a workspace-grouped sidebar, drag the session row onto the destination group's folder/title, a session row or blank area within the group, wait for the group highlight, and release. A result or refusal is shown in a toast.
 
 While a valid destination workspace is highlighted, stale native session-reorder lines are hidden. Leaving the target or ending the drag restores the native indicators. Same-workspace session reordering and dragging workspace groups remain native DSH actions. Flat-list mode has no workspace drop targets; use the menu there.
 

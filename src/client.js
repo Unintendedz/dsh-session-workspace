@@ -352,6 +352,39 @@ function workspaceIdFromElement(element) {
   return workspaceId.trim() === '' ? undefined : workspaceId
 }
 
+function rowFromSingleChildBranch(branch, tree) {
+  for (let node = branch; node !== null && node !== undefined && node !== tree;) {
+    const key = node.getAttribute?.('data-row-key') ?? node.dataset?.rowKey
+    if (typeof key === 'string' && (key.startsWith('workspace:') || key.startsWith('session:'))) return node
+    const role = node.getAttribute?.('role')
+    if (role === 'tree' || role === 'group' || role === 'treeitem') return undefined
+    if (node.children?.length !== 1) return undefined
+    node = node.children[0]
+  }
+  return undefined
+}
+
+function workspaceDropTargetFromElement(element, sourceTree) {
+  const origin = element?.nodeType === 1 ? element : element?.parentElement
+  const targetTree = origin?.closest?.('[role="tree"]')
+  if (sourceTree === undefined || targetTree !== sourceTree) return undefined
+
+  let target
+  for (let container = origin; container !== null && container !== undefined && container !== sourceTree; container = container.parentElement) {
+    if (container.getAttribute?.('role') === 'group') break
+    const workspaceRows = Array.from(container.children ?? [])
+      .map(child => rowFromSingleChildBranch(child, sourceTree))
+      .filter(row => {
+        const key = row?.getAttribute?.('data-row-key') ?? row?.dataset?.rowKey
+        return typeof key === 'string' && key.startsWith('workspace:')
+      })
+    if (workspaceRows.length !== 1) continue
+    const workspaceId = workspaceIdFromElement(workspaceRows[0])
+    if (workspaceId !== undefined) target = { workspaceId, container }
+  }
+  return target
+}
+
 const movingSessions = new Set()
 
 function installSessionDragAndDrop(ctx, t) {
@@ -374,7 +407,8 @@ function installSessionDragAndDrop(ctx, t) {
     setNativeMarkerHidden(drag, false)
     const sourceRow = event.target?.closest?.('[data-row-key^="session:"]') ?? event.target
     const sourceTree = sourceRow?.closest?.('[role="tree"]')
-    const current = { sessionId, sourceTree, state: undefined, handled: false }
+    const sourceWorkspaceId = workspaceDropTargetFromElement(sourceRow, sourceTree)?.workspaceId
+    const current = { sessionId, sourceTree, sourceWorkspaceId, state: undefined, handled: false }
     drag = current
     current.statePromise = Promise.resolve().then(() => ctx.connection.rpc.call(RPC_PATH, 'state', { sessionId }))
       .then((result) => {
@@ -398,16 +432,21 @@ function installSessionDragAndDrop(ctx, t) {
   }
   const onDragOver = (event) => {
     const current = drag
-    const workspaceId = workspaceIdFromElement(event.target)
     if (current === undefined) return
-    if (workspaceId === undefined) {
+    const dropTarget = workspaceDropTargetFromElement(event.target, current.sourceTree)
+    if (dropTarget === undefined) {
       clearHighlight()
       setNativeMarkerHidden(current, false)
       return
     }
+    const { workspaceId } = dropTarget
     const dataTransfer = event.dataTransfer
     if (current.state === undefined) {
       setNativeMarkerHidden(current, false)
+      if (workspaceId === current.sourceWorkspaceId) {
+        clearHighlight()
+        return
+      }
       if (current.failureMessage !== undefined) return
       event.preventDefault()
       event.stopPropagation()
@@ -426,25 +465,30 @@ function installSessionDragAndDrop(ctx, t) {
     if (dataTransfer !== null) dataTransfer.dropEffect = 'move'
     setNativeMarkerHidden(current, true)
     clearHighlight()
-    const row = event.target.closest('[data-row-key^="workspace:"]')
-    row?.setAttribute('data-dsw-drop-target', 'true')
-    highlighted = row
+    dropTarget.container.setAttribute('data-dsw-drop-target', 'true')
+    highlighted = dropTarget.container
   }
   const onDrop = (event) => {
     const current = drag
-    const workspaceId = workspaceIdFromElement(event.target)
     if (current === undefined) return
-    if (workspaceId === undefined) {
+    const dropTarget = workspaceDropTargetFromElement(event.target, current.sourceTree)
+    if (dropTarget === undefined) {
       clearHighlight()
       setNativeMarkerHidden(current, false)
       return
     }
+    const { workspaceId } = dropTarget
     if (current.handled) {
       event.preventDefault()
       event.stopPropagation()
       return
     }
     const state = current.state
+    if (state === undefined && workspaceId === current.sourceWorkspaceId) {
+      clearHighlight()
+      setNativeMarkerHidden(current, false)
+      return
+    }
     if (state !== undefined) {
       const model = workspaceDialogModel(state)
       if (!model.canMove || workspaceId === state.currentWorkspaceId
