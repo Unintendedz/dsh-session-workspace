@@ -35,6 +35,7 @@ const zh = {
   'error.order-boundary': '原生侧栏固定了新会话和置顶分区，这个插入边界无法实现；会话没有移动。',
   'error.position-unsupported': '当前后端不支持会话行间定位；请重新加载本插件后重试，或拖到工作区标题/留白处移动。',
   'error.order-save': '会话已移动，但无法保存侧栏插入位置：{message}',
+  'error.order-changed': '等待期间侧栏已变化，原插入位置不再可用。',
   'error.view-unavailable': '无法核实或释放当前会话视图；未发送移动请求。',
   'error.view-release': '当前会话仍被其他组件保留，未发送移动请求。',
   'error.view-changed': '等待期间当前会话视图已切换；未发送移动请求。',
@@ -68,6 +69,7 @@ const en = {
   'error.order-boundary': 'The native sidebar keeps new and pinned sessions in fixed sections, so this insertion boundary cannot be honored. The session was not moved.',
   'error.position-unsupported': 'The current backend does not support insertion between session rows. Reload this plugin and try again, or drop on the workspace header or empty area to move the session.',
   'error.order-save': 'The session moved, but its sidebar position could not be saved: {message}',
+  'error.order-changed': 'The sidebar changed while moving; the insertion point is no longer available.',
   'error.view-unavailable': 'The current session view cannot be verified or released; no move was sent.',
   'error.view-release': 'Another component still retains this session, so it was not moved.',
   'error.view-changed': 'The current session changed while waiting; no move was sent.',
@@ -217,6 +219,23 @@ function readMainViewState(ctx, sessionId, t) {
 
 function requireMainViewRelease(ctx, sessionId, state, t) {
   if (state.sessionId !== sessionId) throw localizedError(t, 'error.view-unavailable')
+  const sessions = serviceFromContext(ctx, 'sessions')
+  const legacySnapshot = sessions?.list?.getSnapshot?.()
+  // 0.1.5 selects through list.current/open/clear and has no reference service.
+  // Only its cold, non-current path can use the original refresh-only flow.
+  // Missing modern methods alone must not bypass the 0.2 release checks.
+  if (sessions?.retain === undefined && sessions?.retainInfo === undefined && sessions?.using === undefined
+    && typeof sessions?.open === 'function' && typeof sessions?.clear === 'function'
+    && typeof sessions?.refresh === 'function'
+    && Object.hasOwn(legacySnapshot ?? {}, 'current')
+    && legacySnapshot.phase === 'ready' && Array.isArray(legacySnapshot.ids)
+    && legacySnapshot.ids.includes(sessionId) && legacySnapshot.byId?.[sessionId]?.id === sessionId
+    && (legacySnapshot.current === undefined || typeof legacySnapshot.current === 'string')
+    && legacySnapshot.current !== sessionId
+    && state.active === false && state.busy === false
+    && state.supported === true && state.warmMoveSupported === false) {
+    return { sessions, sessionId, wasCurrent: false, legacyCold: true }
+  }
   const before = readMainViewState(ctx, sessionId, t)
   if (typeof before.sessions.refresh !== 'function') {
     throw localizedError(t, 'error.view-unavailable')
@@ -432,11 +451,11 @@ async function moveSessionSafely(ctx, t, state, workspaceId, position, afterComm
       }
       throw error
     }
-  } else if (release.retention.referenceCount !== 0) {
+  } else if (!release.legacyCold && release.retention.referenceCount !== 0) {
     await waitForSessionReferencesToDrain(release, t, release.expectedCurrentSessionId)
   }
 
-  if (!release.wasCurrent) {
+  if (!release.wasCurrent && !release.legacyCold) {
     const beforeMove = readMainViewState(ctx, state.sessionId, t)
     if (beforeMove.currentSessionId !== release.expectedCurrentSessionId) throw userNavigatedError(t)
     if (beforeMove.retention.referenceCount !== 0) throw localizedError(t, 'error.view-release')
@@ -469,7 +488,7 @@ async function moveSessionSafely(ctx, t, state, workspaceId, position, afterComm
     postMoveError = error
     postMoveErrorKind = 'order'
   }
-  if (release.wasCurrent) {
+  if (release.wasCurrent || release.legacyCold) {
     try {
       await release.sessions.refresh()
     } catch (error) {
@@ -914,7 +933,15 @@ function completeNativeSessionOrders(workspaceSnapshot, sessionSnapshot, viewSna
   return { members, orders, summaries, current, currentBlank, pinnedSessionIds, archivedSessionIds, viewSnapshot }
 }
 
-function nativeSessionOrderSeed(ctx, current) {
+function acknowledgeCommittedMoves(committedMoves, workspaceSnapshot) {
+  if (workspaceSnapshot?.phase !== 'ready' || !Array.isArray(workspaceSnapshot.items)) return
+  for (const [id, move] of committedMoves) {
+    const owners = workspaceSnapshot.items.filter(workspace => workspace.sessionIds.includes(id))
+    if (owners.length === 1 && owners[0].workspaceId === move.workspaceId) committedMoves.delete(id)
+  }
+}
+
+function nativeSessionOrderSeed(ctx, current, committedMoves) {
   try {
     const slots = ctx.get('slots')
     const entry = slots.entriesOfSlot(NATIVE_WORKSPACE_SLOT)
@@ -926,8 +953,29 @@ function nativeSessionOrderSeed(ctx, current) {
       || workspaces?.list?.getSnapshot === undefined || sessions?.list?.getSnapshot === undefined) return undefined
 
     const viewSnapshot = view.getSnapshot()
-    const workspaceSnapshot = workspaces.list.getSnapshot()
-    const sessionSnapshot = sessions.list.getSnapshot()
+    let workspaceSnapshot = workspaces.list.getSnapshot()
+    let sessionSnapshot = sessions.list.getSnapshot()
+    if (committedMoves?.size > 0 && Array.isArray(workspaceSnapshot.items)
+      && Array.isArray(sessionSnapshot.ids) && sessionSnapshot.byId !== null
+      && typeof sessionSnapshot.byId === 'object') {
+      // RPC commits and list broadcasts can arrive separately. Until membership
+      // acknowledges a successful move, apply that move's ID/location delta to
+      // the latest list, rather than resurrecting or discarding its saved slot.
+      acknowledgeCommittedMoves(committedMoves, workspaceSnapshot)
+      workspaceSnapshot = { ...workspaceSnapshot, items: workspaceSnapshot.items.map(workspace => ({
+        ...workspace,
+        sessionIds: [
+          ...workspace.sessionIds.filter(id => !committedMoves.has(id)),
+          ...Array.from(committedMoves).filter(([, move]) => move.workspaceId === workspace.workspaceId).map(([id]) => id),
+        ],
+      })) }
+      sessionSnapshot = {
+        ...sessionSnapshot,
+        ids: [...new Set([...sessionSnapshot.ids, ...committedMoves.keys()])],
+        byId: { ...Object.fromEntries(Array.from(committedMoves, ([id, move]) =>
+          [id, { ...move.summary, retainedBy: {} }])), ...sessionSnapshot.byId },
+      }
+    }
     const cached = current.nativeOrderSeed
     if (cached?.view === view && cached.viewSnapshot === viewSnapshot
       && cached.workspaceSnapshot === workspaceSnapshot && cached.sessionSnapshot === sessionSnapshot) return cached
@@ -1026,16 +1074,33 @@ function insertionForPartitionBoundary(order, sessionId, seed, parts, boundary, 
   return anchorSessionId === undefined ? undefined : insertRelative(order, sessionId, anchorSessionId, side)
 }
 
-function nativeSessionOrderPlan(ctx, current, targetWorkspaceId, pointerPosition) {
-  const seed = nativeSessionOrderSeed(ctx, current)
+function nativeSessionOrderPlan(ctx, current, targetWorkspaceId, pointerPosition, committedSource, committedMoves) {
+  const seed = nativeSessionOrderSeed(ctx, current, committedMoves)
   if (seed === undefined) return { error: 'unavailable' }
   const sourceKey = current.sourceWorkspaceId ?? ''
   const sourceMembers = seed.members[sourceKey]
   const targetMembers = seed.members[targetWorkspaceId]
-  const sourceSummary = seed.summaries[current.sessionId]
+  const sourceSummary = seed.summaries[current.sessionId] ?? committedSource
   const targetSummary = seed.summaries[pointerPosition.anchorSessionId]
-  const targetOrder = seed.orders[targetWorkspaceId]
-  if (!Array.isArray(sourceMembers) || !sourceMembers.includes(current.sessionId)
+  const savedOrders = seed.viewSnapshot.sessionOrderByAccount ?? {}
+  const committing = committedSource !== undefined
+  // A previous move can reach this shared store before its membership update.
+  // Preserve the latest saved target slots while adding newly listed members.
+  const targetOrder = committing && seed.viewSnapshot.orderBy === 'manual' && Array.isArray(targetMembers)
+    ? reconcileManualOrder([...new Set([...targetMembers, ...(savedOrders[targetWorkspaceId] ?? [])])],
+      savedOrders[targetWorkspaceId], seed.summaries, seed.pinnedSessionIds, seed.archivedSessionIds)
+      .filter(id => id !== current.sessionId)
+    : seed.orders[targetWorkspaceId]?.filter(id => id !== current.sessionId)
+  if (committing && Array.isArray(targetOrder)) {
+    for (const id of seed.orders[targetWorkspaceId] ?? []) {
+      if (id !== current.sessionId && !targetOrder.includes(id)) targetOrder.push(id)
+    }
+    if (seed.currentBlank !== undefined && targetOrder.includes(seed.currentBlank)) {
+      targetOrder.splice(targetOrder.indexOf(seed.currentBlank), 1)
+      targetOrder.unshift(seed.currentBlank)
+    }
+  }
+  if (!Array.isArray(sourceMembers) || (!committing && !sourceMembers.includes(current.sessionId))
     || !Array.isArray(targetMembers) || !targetMembers.includes(pointerPosition.anchorSessionId)
     || !Array.isArray(targetOrder) || !Array.isArray(seed.orders[sourceKey])
     || sourceSummary === undefined || targetSummary === undefined
@@ -1058,19 +1123,33 @@ function nativeSessionOrderPlan(ctx, current, targetWorkspaceId, pointerPosition
 
   const nextOrder = insertionForPartitionBoundary(targetOrder, current.sessionId, seed, parts, boundary, sourcePinned, pointerPosition)
   if (nextOrder === undefined) return { error: 'unavailable' }
-  const initialOrders = Object.fromEntries(Object.entries(seed.orders).map(([accountKey, order]) => [
-    accountKey,
-    accountKey === sourceKey ? order.filter(id => id !== current.sessionId)
-      : accountKey === targetWorkspaceId ? [...nextOrder]
-        : [...order],
-  ]))
+  const initialOrders = seed.viewSnapshot.orderBy === 'manual'
+    ? { [sourceKey]: (savedOrders[sourceKey] ?? seed.orders[sourceKey])
+      .filter(id => id !== current.sessionId && sourceMembers.includes(id)) }
+    : Object.fromEntries(Object.entries(seed.orders).map(([accountKey, order]) => [
+      accountKey,
+      accountKey === sourceKey ? order.filter(id => id !== current.sessionId)
+        : accountKey === targetWorkspaceId ? [...nextOrder]
+          : [...order],
+    ]))
   return {
     view: seed.view,
     targetWorkspaceId,
     pointerPosition,
     nextOrder,
     initialOrders,
+    sourceSummary,
   }
+}
+
+function commitNativeSessionOrder(ctx, current, plan, committedMoves, t) {
+  // No await between this fresh read and the Native action: each completed move
+  // merges its relative insertion into the preceding commit or user reorder.
+  current.nativeOrderSeed = undefined
+  committedMoves.set(current.sessionId, { workspaceId: plan.targetWorkspaceId, summary: plan.sourceSummary })
+  const latest = nativeSessionOrderPlan(ctx, current, plan.targetWorkspaceId, plan.pointerPosition, plan.sourceSummary, committedMoves)
+  if (latest.error !== undefined) throw new Error(t('error.order-changed'))
+  latest.view.actions.setSessionOrder(latest.targetWorkspaceId, latest.nextOrder, latest.initialOrders)
 }
 
 const movingSessions = new Set()
@@ -1079,6 +1158,11 @@ function installSessionDragAndDrop(ctx, t) {
   let drag
   let highlighted
   let sessionMarker
+  const committedMoves = new Map()
+  const workspaceSource = serviceFromContext(ctx, 'workspaces')?.list
+  const stopAcknowledgingMoves = workspaceSource?.subscribe?.(() => {
+    acknowledgeCommittedMoves(committedMoves, workspaceSource.getSnapshot())
+  })
 
   const clearHighlight = () => {
     highlighted?.removeAttribute('data-dsw-drop-target')
@@ -1276,7 +1360,7 @@ function installSessionDragAndDrop(ctx, t) {
             : { anchorSessionId: orderPlan.pointerPosition.anchorSessionId, side: orderPlan.pointerPosition.side },
           orderPlan === undefined
             ? undefined
-            : () => orderPlan.view.actions.setSessionOrder(orderPlan.targetWorkspaceId, orderPlan.nextOrder, orderPlan.initialOrders),
+            : () => commitNativeSessionOrder(ctx, current, orderPlan, committedMoves, t),
         )
         showToast(t('drag.moved', { title: workspace?.title ?? workspaceId }), { duration: 2200 })
       } catch (error) {
@@ -1307,6 +1391,8 @@ function installSessionDragAndDrop(ctx, t) {
     clearSessionMarker()
     setNativeMarkerHidden(drag, false)
     drag = undefined
+    committedMoves.clear()
+    stopAcknowledgingMoves?.()
   }
 }
 

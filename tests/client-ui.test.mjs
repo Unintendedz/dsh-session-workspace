@@ -90,7 +90,7 @@ function translator(key, values = {}) {
   return Object.entries(values).reduce((value, [name, replacement]) => value.replaceAll(`{${name}}`, replacement), messages[key] ?? key)
 }
 
-function setup({ sessionState = state(), moveResult = { ok: true }, slotSnapshot = [{ name: 'sidebar.workspaces.session.menu.item' }], omitSnapshot = false, nativeOrderState, nativeOrderActionError, mainViewSessionId, missingClearMain = false, missingRetainInfo = false, missingUsing = false, usingReadyError, usingOpenState = 'open', usingOpenError, usingSnapshotError, retainAfterClear = false, initialTargetReferences = 0, clearMainError, retentionErrorAfterClearOnce = false, refreshError } = {}) {
+function setup({ sessionState = state(), moveResult = { ok: true }, slotSnapshot = [{ name: 'sidebar.workspaces.session.menu.item' }], omitSnapshot = false, nativeOrderState, nativeOrderActionError, mainViewSessionId, missingClearMain = false, legacySessions = false, missingRetainInfo = false, missingUsing = false, usingReadyError, usingOpenState = 'open', usingOpenError, usingSnapshotError, retainAfterClear = false, initialTargetReferences = 0, clearMainError, retentionErrorAfterClearOnce = false, refreshError } = {}) {
   const dom = new JSDOM('<!doctype html><html><head></head><body></body></html>', { url: 'http://localhost' })
   const previous = {
     document: globalThis.document,
@@ -111,6 +111,7 @@ function setup({ sessionState = state(), moveResult = { ok: true }, slotSnapshot
   let localeRemoved = false
   const disposers = []
   const nativeOrders = []
+  const workspaceListeners = new Set()
   let nativeViewSnapshot = nativeOrderState?.view
   const nativeView = nativeOrderState === undefined ? undefined : {
     getSnapshot: () => nativeViewSnapshot,
@@ -124,7 +125,10 @@ function setup({ sessionState = state(), moveResult = { ok: true }, slotSnapshot
         nativeViewSnapshot = {
           ...nativeViewSnapshot,
           orderBy: 'manual',
-          sessionOrderByAccount: { ...copiedOrders, [accountKey]: [...order] },
+          sessionOrderByAccount: {
+            ...(nativeViewSnapshot.orderBy === 'manual' ? nativeViewSnapshot.sessionOrderByAccount : {}),
+            ...copiedOrders, [accountKey]: [...order],
+          },
         }
       },
     },
@@ -151,6 +155,13 @@ function setup({ sessionState = state(), moveResult = { ok: true }, slotSnapshot
   }
   const currentSessionSnapshot = () => {
     const base = nativeOrderState?.sessions ?? defaultSessions
+    if (legacySessions) return {
+      ...base, current: selectedMainSessionId,
+      byId: Object.fromEntries(Object.entries(base.byId).map(([id, summary]) => {
+        const { retainedBy, ...legacySummary } = summary
+        return [id, legacySummary]
+      })),
+    }
     if (!overrideMainView) return base
     const ids = [...base.ids]
     const byId = Object.fromEntries(Object.entries(base.byId).map(([id, summary]) => [id, {
@@ -170,6 +181,10 @@ function setup({ sessionState = state(), moveResult = { ok: true }, slotSnapshot
     }
   }
   const sessions = {
+    ...(legacySessions ? {
+      open(id) { lifecycle.push(`legacy-open:${id}`); selectedMainSessionId = id },
+      clear() { lifecycle.push('legacy-clear'); selectedMainSessionId = undefined },
+    } : {}),
     list: {
       getSnapshot: currentSessionSnapshot,
       subscribe(listener) {
@@ -177,7 +192,7 @@ function setup({ sessionState = state(), moveResult = { ok: true }, slotSnapshot
         return () => listListeners.delete(listener)
       },
     },
-    ...(!missingRetainInfo ? {
+    ...(!legacySessions && !missingRetainInfo ? {
       retainInfo(id) {
         let listeners = retentionListeners.get(id)
         if (listeners === undefined) {
@@ -212,7 +227,7 @@ function setup({ sessionState = state(), moveResult = { ok: true }, slotSnapshot
       if (refreshError !== undefined) throw new Error(refreshError)
       for (const id of movedSessionIds) refreshedMovedSessionIds.add(id)
     },
-    ...(!missingUsing ? {
+    ...(!legacySessions && !missingUsing ? {
       async using(id, options, operation) {
         events.push(`using:attempt:${id}`)
         if (movedSessionIds.has(id) && !refreshedMovedSessionIds.has(id)) {
@@ -292,7 +307,10 @@ function setup({ sessionState = state(), moveResult = { ok: true }, slotSnapshot
       if (name === 'slots') return this.slots
       if (name === 'sessions') return sessionService
       if (name === 'uiWorkspace') return uiWorkspace
-      if (name === 'workspaces' && nativeOrderState !== undefined) return { list: { getSnapshot: () => nativeOrderState.workspaces } }
+      if (name === 'workspaces' && nativeOrderState !== undefined) return { list: {
+        getSnapshot: () => nativeOrderState.workspaces,
+        subscribe(listener) { workspaceListeners.add(listener); return () => workspaceListeners.delete(listener) },
+      } }
       if (name === 'sessions' && nativeOrderState !== undefined) return { list: { getSnapshot: () => nativeOrderState.sessions } }
       return undefined
     },
@@ -343,6 +361,8 @@ function setup({ sessionState = state(), moveResult = { ok: true }, slotSnapshot
     ctx,
     calls,
     nativeOrders,
+    nativeView,
+    publishWorkspaces() { for (const listener of workspaceListeners) listener() },
     disposers,
     registration: () => registration,
     lifecycle,
@@ -931,9 +951,9 @@ test('a transient retention snapshot failure after clear restores before any mov
   assert.match(dialog.querySelector('.dsw-status').textContent, /retention snapshot temporarily unavailable/)
 })
 
-test('the bounded legacy menu fallback opens the chooser for the exact fiber session ID', async (t) => {
+test('the bounded 0.1.5 menu fallback moves the exact cold session using the legacy selection API', async (t) => {
   const sessionId = 'legacy-session-exact-id'
-  const app = setup({ sessionState: state({ sessionId }), slotSnapshot: [] })
+  const app = setup({ sessionState: state({ sessionId }), slotSnapshot: [], legacySessions: true, mainViewSessionId: 'other-current' })
   t.after(() => app.teardown())
   assert.equal(app.registration(), undefined, 'an undeclared legacy menu slot must not register a modern entry')
 
@@ -976,6 +996,34 @@ test('the bounded legacy menu fallback opens the chooser for the exact fiber ses
     payload: { sessionId },
   })
   assert.ok(document.querySelector('[role="dialog"]'), 'the legacy item opens the workspace chooser')
+  document.querySelector('.dsw-primary').click()
+  await flush()
+  assert.deepEqual(app.calls.filter(call => call.method === 'move').map(call => call.payload),
+    [{ sessionId, workspaceId: 'new' }])
+  assert.deepEqual(app.lifecycle, ['move', 'refresh'])
+  assert.equal(app.mainSession(), 'other-current', 'legacy refresh neither clears nor opens a session')
+  assert.equal(document.querySelector('.dsw-status').dataset.error, 'false')
+  await new Promise(resolve => setTimeout(resolve, 710))
+})
+
+test('legacy cold compatibility never moves the selected or loaded session or bypasses a broken modern service', async () => {
+  for (const options of [
+    { legacySessions: true, mainViewSessionId: 'session-one' },
+    { legacySessions: true, sessionState: state({ active: true, warmMoveSupported: true }) },
+    { missingRetainInfo: true, missingUsing: true },
+  ]) {
+    const app = setup(options)
+    try {
+      const dialog = await openMenuDialog(app)
+      dialog.querySelector('.dsw-primary').click()
+      await flush()
+      assert.equal(app.calls.some(call => call.method === 'move'), false, JSON.stringify(options))
+      assert.match(dialog.querySelector('.dsw-status').textContent, /cannot be verified/i)
+      assert.deepEqual(app.lifecycle, [])
+    } finally {
+      app.teardown()
+    }
+  }
 })
 
 test('a modern test context without snapshot defaults to the slot path, never the legacy fallback', async (t) => {
@@ -1200,6 +1248,189 @@ test('cross-workspace session boundaries show a plugin marker and send matching 
   app.teardown()
   disposed = true
   assert.equal(localDocument.querySelector('.dsw-session-drop-marker'), null, 'plugin cleanup removes the marker element')
+})
+
+test('a pending positioned move preserves later source, target, and unrelated workspace reorders', async (t) => {
+  let finishMove
+  const pendingMove = new Promise(resolve => { finishMove = resolve })
+  const nativeOrderState = nativeOrderFixture({
+    orderBy: 'manual',
+    items: [
+      { workspaceId: 'old', sessionIds: ['session-one', 'old-a', 'old-b'] },
+      { workspaceId: 'new', sessionIds: ['target-first', 'target-second'] },
+      { workspaceId: 'other', sessionIds: ['other-a', 'other-b'] },
+    ],
+    sessions: ['session-one', 'old-a', 'old-b', 'target-first', 'target-second', 'other-a', 'other-b']
+      .map((id, index) => nativeSession(id, 100 - index)),
+    sessionOrderByAccount: {
+      old: ['session-one', 'old-a', 'old-b'], new: ['target-first', 'target-second'],
+      other: ['other-a', 'other-b'], __flat_session_order__: ['target-second', 'session-one', 'target-first'],
+    },
+  })
+  const app = setup({ nativeOrderState, moveResult: () => pendingMove })
+  t.after(() => app.teardown())
+  const tree = createWorkspaceTree()
+  const source = addWorkspaceGroup(tree, 'old', ['session-one'])
+  const target = addWorkspaceGroup(tree, 'new', ['target-first', 'target-second'])
+  setRect(target.sessions[1].row, { left: 20, top: 100, width: 200, height: 30 })
+  dispatchDrag(app.dom, source.sessions[0].row, 'dragstart')
+  await flush()
+  dispatchDrag(app.dom, target.sessions[1].row, 'drop', undefined, { clientY: 105 })
+  await flush()
+  assert.equal(app.calls.filter(call => call.method === 'move').length, 1)
+  for (const [key, order] of Object.entries({
+    old: ['old-b', 'session-one', 'old-a'], new: ['target-second', 'target-first'], other: ['other-b', 'other-a'],
+  })) app.nativeView.actions.setSessionOrder(key, order, {})
+  // The Host may publish membership and remove a warm summary before replying.
+  nativeOrderState.workspaces = { ...nativeOrderState.workspaces, items: [
+    { workspaceId: 'old', sessionIds: ['old-a', 'old-b'] },
+    { workspaceId: 'new', sessionIds: ['target-first', 'session-one', 'target-second'] },
+    { workspaceId: 'other', sessionIds: ['other-a', 'other-b'] },
+  ] }
+  const { 'session-one': removed, ...remaining } = nativeOrderState.sessions.byId
+  nativeOrderState.sessions = { ...nativeOrderState.sessions, byId: remaining }
+  finishMove({ ok: true })
+  await flush()
+  const orders = app.nativeView.getSnapshot().sessionOrderByAccount
+  assert.deepEqual(orders.old, ['old-b', 'old-a'])
+  assert.deepEqual(orders.new, ['session-one', 'target-second', 'target-first'])
+  assert.deepEqual(orders.other, ['other-b', 'other-a'])
+  assert.deepEqual(orders.__flat_session_order__, ['target-second', 'session-one', 'target-first'])
+  assert.deepEqual(Object.keys(app.nativeOrders.at(-1).initialOrders), ['old'], 'manual commits patch only the source and target')
+})
+
+for (const orderBy of ['updated', 'manual']) {
+  test(`concurrent positioned moves merge in completion order from ${orderBy} sorting before membership catches up`, async (t) => {
+    const finish = new Map()
+    const nativeOrderState = nativeOrderFixture({
+      orderBy,
+      items: [
+        { workspaceId: 'old', sessionIds: ['session-one', 'session-two', 'old-other'] },
+        { workspaceId: 'new', sessionIds: ['target-first', 'target-second'] },
+      ],
+      sessions: ['session-one', 'session-two', 'old-other', 'target-first', 'target-second']
+        .map((id, index) => nativeSession(id, 100 - index)),
+      sessionOrderByAccount: {
+        old: ['session-one', 'session-two', 'old-other'], new: ['target-first', 'target-second'],
+      },
+    })
+    const app = setup({ nativeOrderState, moveResult: payload => new Promise(resolve => { finish.set(payload.sessionId, resolve) }) })
+    t.after(() => app.teardown())
+    const tree = createWorkspaceTree()
+    const source = addWorkspaceGroup(tree, 'old', ['session-one', 'session-two'])
+    const target = addWorkspaceGroup(tree, 'new', ['target-first', 'target-second'])
+    target.sessions.forEach((session, index) => setRect(session.row, { left: 20, top: 100 + index * 40, width: 200, height: 30 }))
+    dispatchDrag(app.dom, source.sessions[0].row, 'dragstart')
+    await flush()
+    dispatchDrag(app.dom, target.sessions[1].row, 'drop', undefined, { clientY: 145 })
+    await flush()
+    dispatchDrag(app.dom, source.sessions[0].row, 'dragend')
+    dispatchDrag(app.dom, source.sessions[1].row, 'dragstart')
+    await flush()
+    dispatchDrag(app.dom, target.sessions[0].row, 'drop', undefined, { clientY: 125 })
+    await flush()
+    assert.equal(finish.size, 2)
+    finish.get('session-two')({ ok: true })
+    await flush()
+    assert.deepEqual(app.nativeView.getSnapshot().sessionOrderByAccount.new, ['target-first', 'session-two', 'target-second'])
+    finish.get('session-one')({ ok: true })
+    await flush()
+    const orders = app.nativeView.getSnapshot().sessionOrderByAccount
+    assert.deepEqual(orders.new, ['target-first', 'session-two', 'session-one', 'target-second'])
+    assert.deepEqual(orders.old, ['old-other'], 'the later commit must not re-add an already moved source member')
+    assert.equal(document.querySelector('[role="alert"]'), null)
+  })
+}
+
+test('opposite-direction pending moves preserve both insertion slots before membership catches up', async (t) => {
+  const finish = {}
+  const pending = Object.fromEntries(['a', 'b'].map(id => [id, new Promise(resolve => { finish[id] = resolve })]))
+  const nativeOrderState = nativeOrderFixture({
+    orderBy: 'manual',
+    sessionOrderByAccount: { old: ['a', 'old-anchor'], new: ['b', 'new-anchor'] },
+    items: [
+      { workspaceId: 'old', sessionIds: ['a', 'old-anchor'] },
+      { workspaceId: 'new', sessionIds: ['b', 'new-anchor'] },
+    ],
+    sessions: ['a', 'b', 'old-anchor', 'new-anchor'].map((id, index) => nativeSession(id, 100 - index)),
+  })
+  const app = setup({ sessionState: state({ sessionId: 'a' }), nativeOrderState, moveResult: payload => pending[payload.sessionId] })
+  t.after(() => app.teardown())
+  const call = app.ctx.connection.rpc.call
+  app.ctx.connection.rpc.call = async (path, method, payload) => {
+    const result = await call(path, method, payload)
+    if (method === 'state') result.value.currentWorkspaceId = payload.sessionId === 'a' ? 'old' : 'new'
+    return result
+  }
+  const tree = createWorkspaceTree()
+  const oldGroup = addWorkspaceGroup(tree, 'old', ['a', 'old-anchor'])
+  const newGroup = addWorkspaceGroup(tree, 'new', ['b', 'new-anchor'])
+  for (const group of [oldGroup, newGroup]) setRect(group.sessions[1].row, { left: 20, top: 100, width: 200, height: 30 })
+  dispatchDrag(app.dom, oldGroup.sessions[0].row, 'dragstart')
+  await flush()
+  dispatchDrag(app.dom, newGroup.sessions[1].row, 'drop', undefined, { clientY: 105 })
+  await flush()
+  dispatchDrag(app.dom, oldGroup.sessions[0].row, 'dragend')
+  dispatchDrag(app.dom, newGroup.sessions[0].row, 'dragstart')
+  await flush()
+  dispatchDrag(app.dom, oldGroup.sessions[1].row, 'drop', undefined, { clientY: 105 })
+  await flush()
+  assert.equal(app.calls.filter(call => call.method === 'move').length, 2)
+  finish.a({ ok: true, value: { sessionId: 'a', workspaceId: 'new' } })
+  await flush()
+  const view = app.nativeView
+  assert.deepEqual(view.getSnapshot().sessionOrderByAccount.new, ['b', 'a', 'new-anchor'])
+  finish.b({ ok: true, value: { sessionId: 'b', workspaceId: 'old' } })
+  await flush()
+  const actual = view.getSnapshot().sessionOrderByAccount
+  assert.deepEqual(actual.old, ['b', 'old-anchor'])
+  assert.deepEqual(actual.new, ['a', 'new-anchor'])
+})
+
+test('acknowledged membership no longer overrides a later move of the same session', async (t) => {
+  const nativeOrderState = nativeOrderFixture({
+    items: [
+      { workspaceId: 'old', sessionIds: ['session-one'] },
+      { workspaceId: 'new', sessionIds: ['target-first', 'target-second'] },
+    ],
+  })
+  const app = setup({ nativeOrderState })
+  t.after(() => app.teardown())
+  const tree = createWorkspaceTree()
+  const source = addWorkspaceGroup(tree, 'old', ['session-one'])
+  const target = addWorkspaceGroup(tree, 'new', ['target-first', 'target-second'])
+  setRect(target.sessions[1].row, { left: 20, top: 100, width: 200, height: 30 })
+  dispatchDrag(app.dom, source.sessions[0].row, 'dragstart')
+  await flush()
+  dispatchDrag(app.dom, target.sessions[1].row, 'drop', undefined, { clientY: 105 })
+  await flush()
+  dispatchDrag(app.dom, source.sessions[0].row, 'dragend')
+  nativeOrderState.workspaces.items = [
+    { workspaceId: 'old', sessionIds: [] },
+    { workspaceId: 'new', sessionIds: ['target-first', 'session-one', 'target-second'] },
+  ]
+  app.publishWorkspaces()
+  // A later menu move returns the first session before another positioned drag.
+  nativeOrderState.workspaces.items = [
+    { workspaceId: 'old', sessionIds: ['session-one'] },
+    { workspaceId: 'new', sessionIds: ['target-first', 'target-second'] },
+  ]
+  app.publishWorkspaces()
+  app.nativeView.actions.setSessionOrder('old', ['session-one'], { new: ['target-first', 'target-second'] })
+  const call = app.ctx.connection.rpc.call
+  app.ctx.connection.rpc.call = async (path, method, payload) => {
+    const result = await call(path, method, payload)
+    if (method === 'state') result.value.currentWorkspaceId = 'new'
+    return result
+  }
+  setRect(source.sessions[0].row, { left: 20, top: 40, width: 200, height: 30 })
+  dispatchDrag(app.dom, target.sessions[0].row, 'dragstart')
+  await flush()
+  dispatchDrag(app.dom, source.sessions[0].row, 'drop', undefined, { clientY: 45 })
+  await flush()
+  assert.deepEqual(app.nativeView.getSnapshot().sessionOrderByAccount.old, ['target-first', 'session-one'])
+  assert.deepEqual(app.nativeView.getSnapshot().sessionOrderByAccount.new, ['target-second'])
+  assert.equal(document.querySelector('[role="alert"]'), null)
 })
 
 test('Native fixed sections reject impossible boundaries and preserve the normal-after-last-pin boundary', async (t) => {
