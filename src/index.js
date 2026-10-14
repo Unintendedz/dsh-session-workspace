@@ -56,6 +56,7 @@ export function createRpcHandler(ctx) {
         error: {
           code: error instanceof WorkspaceMoveError ? error.code : 'internal',
           message: error instanceof Error ? error.message : String(error),
+          details: {},
         },
       }
     }

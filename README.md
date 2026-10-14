@@ -8,7 +8,7 @@ Use either **Move to another workspace** in the session's sidebar menu or drag t
 
 ## Safety
 
-- Only cold sessions can move. If the session is open or running, switch to another session and try again after it closes.
+- Only cold sessions with no Host Agent or open write handle can move. In DSH `0.2.0-rc.2`, switching to another session does not close these resources.
 - The destination must be an existing workspace registered in DSH.
 - Existing destination artifacts are never overwritten.
 - The source revision is checked before commit. A session that changes during preparation is rejected.
@@ -31,7 +31,7 @@ Build and install the checked-out version:
 npm ci
 npm run build
 npm pack
-dsh plugin --profile web add ./dsh-session-workspace-0.2.0.tgz
+dsh plugin --profile web add ./dsh-session-workspace-0.2.2.tgz
 ```
 
 Use `--profile desktop` instead of `--profile web` for the official desktop app.
@@ -44,7 +44,7 @@ Install the built archive and reload its profile. The native path supports V3 an
 
 ## Use
 
-1. Switch away from the session you want to move so it is no longer active.
+1. Use a cold session with no Host Agent or open write handle. In DSH `0.2.0-rc.2`, switching to another session releases the UI view but keeps the Host Agent and its write handle. After a normal, safe DSH restart, move the session before opening it again.
 2. Use either entry point:
    - **Menu:** open that session's **⋯** menu, select **Move to another workspace**, choose the destination and confirm.
    - **Drag:** in a workspace-grouped sidebar, drag the session row onto the destination workspace's folder/title row and release. A result or refusal is shown in a toast.

@@ -8,7 +8,7 @@
 
 ## 安全设计
 
-- 只允许迁移冷 session。若 session 正在打开或运行，请先切换到另一个 session，等它关闭后再操作。
+- 只允许迁移没有 Host Agent 或打开写入句柄的冷 session。DSH `0.2.0-rc.2` 切换到其他 session 不会关闭这些资源。
 - 目标必须是 DSH 中已经注册的现有工作区。
 - 绝不覆盖目标位置已有的 session 文件。
 - 提交前会再次核对源文件修订；准备期间发生变化会直接拒绝。
@@ -29,7 +29,7 @@
 npm ci
 npm run build
 npm pack
-dsh plugin --profile web add ./dsh-session-workspace-0.2.0.tgz
+dsh plugin --profile web add ./dsh-session-workspace-0.2.2.tgz
 ```
 
 官方桌面应用请改用 `--profile desktop`。
@@ -42,7 +42,7 @@ dsh plugin --profile web add ./dsh-session-workspace-0.2.0.tgz
 
 ## 使用
 
-1. 先切换离开要迁移的 session，让它不再处于活动状态。
+1. 待迁移会话必须是没有 Host Agent 或打开写入句柄的冷会话。DSH `0.2.0-rc.2` 切换到其他会话只释放界面引用，不会关闭 Host Agent 和写入句柄；在正常、安全地重启 DSH 后，请先移动，再打开该会话。
 2. 任选一个入口：
    - **菜单：** 打开该会话的 **⋯**，点击 **移动到其他工作区**，选择目标工作区并确认。
    - **拖动：** 在按工作区分组的侧边栏中，把会话行拖到目标工作区的文件夹／标题行后松手；结果或拒绝原因会以提示显示。
