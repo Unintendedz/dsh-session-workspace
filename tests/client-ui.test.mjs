@@ -79,6 +79,7 @@ const messages = {
   'error.order-save': 'The session moved, but its sidebar position could not be saved: {message}',
   'error.view-unavailable': 'The current session view cannot be verified or released; no move was sent.',
   'error.view-release': 'Another component still retains this session, so it was not moved.',
+  'error.view-changed': 'The current session changed while waiting; no move was sent.',
   'error.move-restore': 'The move failed: {moveMessage}; the original session view could not be restored: {restoreMessage}',
   'error.view-restore': 'The session moved, but its view could not be refreshed and reopened: {message}',
 }
@@ -87,7 +88,7 @@ function translator(key, values = {}) {
   return Object.entries(values).reduce((value, [name, replacement]) => value.replaceAll(`{${name}}`, replacement), messages[key] ?? key)
 }
 
-function setup({ sessionState = state(), moveResult = { ok: true }, slotSnapshot = [{ name: 'sidebar.workspaces.session.menu.item' }], omitSnapshot = false, nativeOrderState, nativeOrderActionError, mainViewSessionId, missingClearMain = false, missingRetainInfo = false, retainAfterClear = false, clearMainError, retentionErrorAfterClearOnce = false, refreshError } = {}) {
+function setup({ sessionState = state(), moveResult = { ok: true }, slotSnapshot = [{ name: 'sidebar.workspaces.session.menu.item' }], omitSnapshot = false, nativeOrderState, nativeOrderActionError, mainViewSessionId, missingClearMain = false, missingRetainInfo = false, retainAfterClear = false, initialTargetReferences = 0, initialTargetReleaseDelayMs = 0, referenceReleaseDelayMs = 0, clearMainError, retentionErrorAfterClearOnce = false, refreshError } = {}) {
   const dom = new JSDOM('<!doctype html><html><head></head><body></body></html>', { url: 'http://localhost' })
   const previous = {
     document: globalThis.document,
@@ -130,6 +131,11 @@ function setup({ sessionState = state(), moveResult = { ok: true }, slotSnapshot
   let postClearRetained = false
   let clearAttempted = false
   let retentionErrorThrown = false
+  let releaseTimer
+  let initialReleaseTimer
+  let targetReferenceCount = initialTargetReferences
+  const listListeners = new Set()
+  const retentionListeners = new Map()
   const coldSummary = nativeSession(sessionState.sessionId, 0)
   delete coldSummary.retainedBy
   const defaultSessions = {
@@ -151,10 +157,33 @@ function setup({ sessionState = state(), moveResult = { ok: true }, slotSnapshot
     }
     return { ...base, ids, byId }
   }
+  const publishSessionSources = () => {
+    for (const listener of [...listListeners]) listener()
+    for (const listeners of retentionListeners.values()) {
+      for (const listener of [...listeners]) listener()
+    }
+  }
+  if (initialTargetReleaseDelayMs > 0) {
+    initialReleaseTimer = setTimeout(() => {
+      targetReferenceCount = 0
+      publishSessionSources()
+    }, initialTargetReleaseDelayMs)
+  }
   const sessions = {
-    list: { getSnapshot: currentSessionSnapshot },
+    list: {
+      getSnapshot: currentSessionSnapshot,
+      subscribe(listener) {
+        listListeners.add(listener)
+        return () => listListeners.delete(listener)
+      },
+    },
     ...(!missingRetainInfo ? {
       retainInfo(id) {
+        let listeners = retentionListeners.get(id)
+        if (listeners === undefined) {
+          listeners = new Set()
+          retentionListeners.set(id, listeners)
+        }
         return {
           getSnapshot() {
             if (clearAttempted && retentionErrorAfterClearOnce && !retentionErrorThrown) {
@@ -164,8 +193,14 @@ function setup({ sessionState = state(), moveResult = { ok: true }, slotSnapshot
             const summary = currentSessionSnapshot().byId[id]
             const retainedBy = summary?.retainedBy ?? {}
             const referenceCount = Object.values(retainedBy).reduce((sum, count) => sum + (Number.isSafeInteger(count) ? count : 0), 0)
-              + (postClearRetained && id === mainViewSessionId ? 1 : 0)
+              + (id === sessionState.sessionId
+                ? clearAttempted ? (postClearRetained ? 1 : 0) : targetReferenceCount
+                : 0)
             return { referenceCount, retainedBy }
+          },
+          subscribe(listener) {
+            listeners.add(listener)
+            return () => listeners.delete(listener)
           },
         }
       },
@@ -182,7 +217,14 @@ function setup({ sessionState = state(), moveResult = { ok: true }, slotSnapshot
         clearAttempted = true
         overrideMainView = true
         selectedMainSessionId = undefined
-        postClearRetained = retainAfterClear
+        postClearRetained = retainAfterClear || referenceReleaseDelayMs > 0
+        if (referenceReleaseDelayMs > 0) {
+          releaseTimer = setTimeout(() => {
+            postClearRetained = false
+            publishSessionSources()
+          }, referenceReleaseDelayMs)
+        }
+        publishSessionSources()
         if (clearMainError !== undefined) throw new Error(clearMainError)
       },
     } : {}),
@@ -191,6 +233,7 @@ function setup({ sessionState = state(), moveResult = { ok: true }, slotSnapshot
       overrideMainView = true
       selectedMainSessionId = id
       postClearRetained = false
+      publishSessionSources()
     },
   }
   const sessionService = sessions
@@ -255,10 +298,19 @@ function setup({ sessionState = state(), moveResult = { ok: true }, slotSnapshot
       overrideMainView = true
       selectedMainSessionId = id
       postClearRetained = false
+      publishSessionSources()
     },
     mainSession: () => selectedMainSessionId,
+    observerCounts(id = sessionState.sessionId) {
+      return {
+        list: listListeners.size,
+        retention: retentionListeners.get(id)?.size ?? 0,
+      }
+    },
     teardown() {
       for (const dispose of disposers.reverse()) dispose()
+      clearTimeout(releaseTimer)
+      clearTimeout(initialReleaseTimer)
       dom.window.close()
       if (previous.document === undefined) delete globalThis.document
       else globalThis.document = previous.document
@@ -427,6 +479,32 @@ test('moving an opened idle main session from the menu releases and reopens the 
   await new Promise(resolve => setTimeout(resolve, 710))
 })
 
+test('an opened main session waits for its old generation to retire before moving', async (t) => {
+  const app = setup({
+    sessionState: state({ active: true, warmMoveSupported: true }),
+    mainViewSessionId: 'session-one',
+    referenceReleaseDelayMs: 40,
+  })
+  t.after(() => app.teardown())
+
+  const dialog = await openMenuDialog(app)
+  dialog.querySelector('.dsw-primary').click()
+  await flush()
+
+  assert.deepEqual(app.lifecycle, ['clearMain'], 'migration waits while the old generation still has an owner')
+  assert.deepEqual(app.observerCounts(), { list: 1, retention: 1 }, 'both public snapshots are observed during the wait')
+  await new Promise(resolve => setTimeout(resolve, 70))
+  await flush()
+
+  assert.deepEqual(app.lifecycle, ['clearMain', 'move', 'refresh', 'openSession:session-one'])
+  assert.equal(app.calls.filter(call => call.method === 'move').length, 1)
+  assert.deepEqual(app.calls.filter(call => call.method === 'move').at(-1).payload,
+    { sessionId: 'session-one', workspaceId: 'new' })
+  assert.equal(app.mainSession(), 'session-one', 'the same ID receives a fresh opened view after its prior generation retires')
+  assert.deepEqual(app.observerCounts(), { list: 0, retention: 0 }, 'success unsubscribes both release observers')
+  await new Promise(resolve => setTimeout(resolve, 710))
+})
+
 test('precise drag of an opened idle main session releases, moves, reorders, refreshes, and reopens', async (t) => {
   const app = setup({
     sessionState: state({ active: true, warmMoveSupported: true }),
@@ -506,6 +584,49 @@ test('moving a non-current loaded session leaves the current view unchanged', as
   await new Promise(resolve => setTimeout(resolve, 710))
 })
 
+test('a non-current target waits for its references without disturbing the current view', async (t) => {
+  const app = setup({
+    sessionState: state({ active: true, warmMoveSupported: true }),
+    mainViewSessionId: 'already-open-session',
+    initialTargetReferences: 1,
+    initialTargetReleaseDelayMs: 40,
+  })
+  t.after(() => app.teardown())
+  const dialog = await openMenuDialog(app)
+  dialog.querySelector('.dsw-primary').click()
+  await flush()
+
+  assert.deepEqual(app.lifecycle, [], 'the move waits for other owners of the target generation')
+  assert.deepEqual(app.observerCounts(), { list: 1, retention: 1 })
+  await new Promise(resolve => setTimeout(resolve, 70))
+  await flush()
+
+  assert.deepEqual(app.lifecycle, ['move', 'refresh'])
+  assert.equal(app.calls.filter(call => call.method === 'move').length, 1)
+  assert.equal(app.mainSession(), 'already-open-session', 'waiting never clears or changes the current view')
+  assert.deepEqual(app.observerCounts(), { list: 0, retention: 0 })
+  await new Promise(resolve => setTimeout(resolve, 710))
+})
+
+test('a retained non-current target cannot move while its old generation remains alive', async (t) => {
+  const app = setup({
+    sessionState: state({ active: true, warmMoveSupported: true }),
+    mainViewSessionId: 'already-open-session',
+    initialTargetReferences: 1,
+  })
+  t.after(() => app.teardown())
+  const dialog = await openMenuDialog(app)
+  dialog.querySelector('.dsw-primary').click()
+  await new Promise(resolve => setTimeout(resolve, 2100))
+  await flush()
+
+  assert.equal(app.calls.some(call => call.method === 'move'), false, 'a retained generation is never migrated')
+  assert.deepEqual(app.lifecycle, [], 'a non-current target is not cleared or reopened')
+  assert.equal(app.mainSession(), 'already-open-session', 'the other current view stays selected')
+  assert.deepEqual(app.observerCounts(), { list: 0, retention: 0 }, 'timeout unsubscribes both release observers')
+  assert.match(dialog.querySelector('.dsw-status').textContent, /still retains this session/i)
+})
+
 test('a current cold session also requires the backend release capability before clearMain', async (t) => {
   const app = setup({
     sessionState: state({ active: false, warmMoveSupported: false }),
@@ -558,7 +679,7 @@ test('drag refuses a busy or queued session without clearing the view or cancell
 })
 
 test('current-session move fails closed when the Native release seam or retention accounting is unavailable', async (t) => {
-  for (const options of [{ missingClearMain: true }, { missingRetainInfo: true }, { retainAfterClear: true }]) {
+  for (const options of [{ missingClearMain: true }, { missingRetainInfo: true }]) {
     const app = setup({
       sessionState: state({ active: true, warmMoveSupported: true }),
       mainViewSessionId: 'session-one',
@@ -569,14 +690,50 @@ test('current-session move fails closed when the Native release seam or retentio
     await flush()
     assert.equal(app.calls.some(call => call.method === 'move'), false, JSON.stringify(options))
     assert.ok(dialog.querySelector('.dsw-status').textContent.length > 0)
-    if (options.retainAfterClear) {
-      assert.deepEqual(app.lifecycle, ['clearMain', 'openSession:session-one'])
-      assert.equal(app.mainSession(), 'session-one')
-    } else {
-      assert.deepEqual(app.lifecycle, [])
-    }
+    assert.deepEqual(app.lifecycle, [])
     app.teardown()
   }
+})
+
+test('a current session whose references never drain times out without migration and is restored', async (t) => {
+  const app = setup({
+    sessionState: state({ active: true, warmMoveSupported: true }),
+    mainViewSessionId: 'session-one',
+    retainAfterClear: true,
+  })
+  t.after(() => app.teardown())
+  const dialog = await openMenuDialog(app)
+  dialog.querySelector('.dsw-primary').click()
+  await new Promise(resolve => setTimeout(resolve, 2100))
+  await flush()
+
+  assert.equal(app.calls.some(call => call.method === 'move'), false, 'timeout is fail-closed before the RPC')
+  assert.deepEqual(app.lifecycle, ['clearMain', 'openSession:session-one'], 'the original ID is restored after timeout')
+  assert.equal(app.mainSession(), 'session-one')
+  assert.deepEqual(app.observerCounts(), { list: 0, retention: 0 }, 'timeout unsubscribes both release observers')
+  assert.match(dialog.querySelector('.dsw-status').textContent, /still retains this session/i)
+})
+
+test('a user selection during reference release aborts immediately without reclaiming the view', async (t) => {
+  const app = setup({
+    sessionState: state({ active: true, warmMoveSupported: true }),
+    mainViewSessionId: 'session-one',
+    referenceReleaseDelayMs: 2500,
+  })
+  t.after(() => app.teardown())
+  const dialog = await openMenuDialog(app)
+  dialog.querySelector('.dsw-primary').click()
+  await flush()
+  assert.deepEqual(app.lifecycle, ['clearMain'], 'the move remains pending while another component retains the generation')
+
+  app.selectMainSession('user-selected-session')
+  await flush()
+
+  assert.equal(app.calls.some(call => call.method === 'move'), false)
+  assert.deepEqual(app.lifecycle, ['clearMain', 'user-select:user-selected-session'])
+  assert.equal(app.mainSession(), 'user-selected-session', 'navigation is never overwritten by a restore')
+  assert.deepEqual(app.observerCounts(), { list: 0, retention: 0 }, 'navigation abort unsubscribes both release observers')
+  assert.match(dialog.querySelector('.dsw-status').textContent, /session changed while waiting/i)
 })
 
 test('a clearMain exception restores the original main view and prevents migration', async (t) => {

@@ -56,7 +56,7 @@ dsh plugin --profile web add ./dsh-session-workspace-0.2.7.tgz
 
 迁移后 session ID 不变，会出现在目标工作区下；后续 shell、文件系统和 sandbox 操作都会使用目标工作区路径。
 
-宿主没有公开的单会话关闭接口。已加载会话适配仅调用原生 `agentLoop.lifecycle(id)` 的完整释放回调，不单独删除 registry 或卸载 scope fiber；它等待 writer 关闭后验证原生写锁可重新取得。客户端的 `clearMain()` 同样是此版本的内部兼容接口，用于清除旧历史 generation；重新打开使用公开 `openSession()`。这两处都不应被视为未来 DSH 版本的稳定 API。
+宿主没有公开的单会话关闭接口。已加载会话适配仅调用原生 `agentLoop.lifecycle(id)` 的完整释放回调，不单独删除 registry 或卸载 scope fiber；它等待 writer 关闭后验证原生写锁可重新取得。客户端的 `clearMain()` 同样是此版本的内部兼容接口。客户端订阅原生引用状态，最多等待两秒，让当前会话的所有界面引用释放后创建新的历史 generation；引用仍保留或用户选中了其他会话时停止移动，不强制关闭其他视图。重新打开原 ID 使用公开 `openSession()`。这两处都不应被视为未来 DSH 版本的稳定 API。
 
 ## 卸载
 

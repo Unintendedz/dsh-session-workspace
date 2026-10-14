@@ -9,6 +9,7 @@ const CROSS_WORKSPACE_TREE_ATTRIBUTE = 'data-dsw-cross-workspace-drop-active'
 const NATIVE_WORKSPACE_SLOT = 'sidebar.workspaces'
 const NATIVE_VIEW_PERSIST = 'dsh.workspace.view.v5'
 const FLAT_SESSION_ORDER_KEY = '__flat_session_order__'
+const SESSION_RELEASE_WAIT_MS = 2000
 
 const zh = {
   'menu.move': '移动到其他工作区',
@@ -35,6 +36,7 @@ const zh = {
   'error.order-save': '会话已移动，但无法保存侧栏插入位置：{message}',
   'error.view-unavailable': '无法核实或释放当前会话视图；未发送移动请求。',
   'error.view-release': '当前会话仍被其他组件保留，未发送移动请求。',
+  'error.view-changed': '等待期间当前会话视图已切换；未发送移动请求。',
   'error.view-release-restore': '无法准备当前会话视图：{message}；恢复原会话也失败：{restoreMessage}。未发送移动请求。',
   'error.move-restore': '移动失败：{moveMessage}；并且无法恢复原会话视图：{restoreMessage}',
   'error.view-restore': '会话已移动，但无法刷新并重新打开原会话：{message}',
@@ -65,6 +67,7 @@ const en = {
   'error.order-save': 'The session moved, but its sidebar position could not be saved: {message}',
   'error.view-unavailable': 'The current session view cannot be verified or released; no move was sent.',
   'error.view-release': 'Another component still retains this session, so it was not moved.',
+  'error.view-changed': 'The current session changed while waiting; no move was sent.',
   'error.view-release-restore': 'Could not prepare the current session view: {message}; restoring the original session also failed: {restoreMessage}. No move was sent.',
   'error.move-restore': 'The move failed: {moveMessage}; the original session view could not be restored: {restoreMessage}',
   'error.view-restore': 'The session moved, but its view could not be refreshed and reopened: {message}',
@@ -151,9 +154,11 @@ function serviceFromContext(ctx, name) {
 
 function readMainViewState(ctx, sessionId, t) {
   const sessions = serviceFromContext(ctx, 'sessions')
-  const snapshot = sessions?.list?.getSnapshot?.()
+  const listSource = sessions?.list
+  const snapshot = listSource?.getSnapshot?.()
   const summary = snapshot?.byId?.[sessionId]
-  const retention = sessions?.retainInfo?.(sessionId)?.getSnapshot?.()
+  const retentionSource = sessions?.retainInfo?.(sessionId)
+  const retention = retentionSource?.getSnapshot?.()
   if (snapshot?.phase !== 'ready' || snapshot.byId === null || typeof snapshot.byId !== 'object'
     || summary === undefined
     || retention === undefined || retention.retainedBy === null || typeof retention.retainedBy !== 'object'
@@ -198,6 +203,8 @@ function readMainViewState(ctx, sessionId, t) {
 
   return {
     sessions,
+    listSource,
+    retentionSource,
     retention,
     currentSessionId: currentIds[0],
   }
@@ -210,10 +217,15 @@ function requireMainViewRelease(ctx, sessionId, state, t) {
     throw localizedError(t, 'error.view-unavailable')
   }
   if (before.currentSessionId !== sessionId) {
-    return { ...before, sessionId, wasCurrent: false }
+    return { ...before, sessionId, wasCurrent: false, expectedCurrentSessionId: before.currentSessionId }
   }
 
   if (state.warmMoveSupported !== true) {
+    throw localizedError(t, 'error.view-unavailable')
+  }
+
+  if (typeof before.listSource?.subscribe !== 'function'
+    || typeof before.retentionSource?.subscribe !== 'function') {
     throw localizedError(t, 'error.view-unavailable')
   }
 
@@ -246,6 +258,123 @@ function restoreMainSessionIfVacant(ctx, release, t) {
   }
 }
 
+function readReleaseWaitState(release, t) {
+  const snapshot = release.listSource.getSnapshot()
+  const retention = release.retentionSource.getSnapshot()
+  if (snapshot?.phase !== 'ready' || snapshot.byId === null || typeof snapshot.byId !== 'object'
+    || snapshot.byId[release.sessionId] === undefined
+    || retention?.retainedBy === null || typeof retention?.retainedBy !== 'object'
+    || !Number.isSafeInteger(retention.referenceCount) || retention.referenceCount < 0) {
+    throw localizedError(t, 'error.view-unavailable')
+  }
+
+  const targetMainView = retention.retainedBy.mainView ?? 0
+  if (!Number.isSafeInteger(targetMainView) || targetMainView < 0) {
+    throw localizedError(t, 'error.view-unavailable')
+  }
+  const summaryTargetMainView = snapshot.byId[release.sessionId].retainedBy?.mainView
+  if (summaryTargetMainView !== undefined
+    && (!Number.isSafeInteger(summaryTargetMainView) || summaryTargetMainView < 0)) {
+    throw localizedError(t, 'error.view-unavailable')
+  }
+
+  const currentIds = []
+  for (const [id, candidate] of Object.entries(snapshot.byId)) {
+    let mainView = candidate?.retainedBy?.mainView
+    if (mainView === undefined) {
+      const otherRetention = release.sessions.retainInfo?.(id)?.getSnapshot?.()
+      if (otherRetention?.retainedBy === null || typeof otherRetention?.retainedBy !== 'object') {
+        throw localizedError(t, 'error.view-unavailable')
+      }
+      mainView = otherRetention.retainedBy.mainView ?? 0
+    }
+    if (!Number.isSafeInteger(mainView) || mainView < 0) {
+      throw localizedError(t, 'error.view-unavailable')
+    }
+    if (mainView > 0) currentIds.push(id)
+  }
+
+  return { retention, targetMainView, summaryTargetMainView, currentIds }
+}
+
+function userNavigatedError(t) {
+  const error = localizedError(t, 'error.view-changed')
+  error.userNavigated = true
+  return error
+}
+
+function waitForSessionReferencesToDrain(release, t, expectedCurrentSessionId) {
+  return new Promise((resolve, reject) => {
+    let settled = false
+    let installing = true
+    let timer
+    const disposers = []
+    const cleanup = () => {
+      clearTimeout(timer)
+      for (const dispose of disposers.splice(0).reverse()) {
+        try { dispose() } catch {}
+      }
+    }
+    const finish = (callback, value) => {
+      if (settled) return
+      settled = true
+      cleanup()
+      callback(value)
+    }
+    const check = () => {
+      if (settled) return
+      try {
+        const observed = readReleaseWaitState(release, t)
+        const expectedCurrentIds = expectedCurrentSessionId === undefined ? [] : [expectedCurrentSessionId]
+        const currentUnchanged = release.wasCurrent
+          ? observed.currentIds.every(id => id === release.sessionId)
+          : observed.currentIds.length === expectedCurrentIds.length
+            && expectedCurrentIds.every(id => observed.currentIds.includes(id))
+        if (!currentUnchanged) {
+          finish(reject, userNavigatedError(t))
+          return
+        }
+        const currentReleased = release.wasCurrent
+          ? observed.currentIds.length === 0 && observed.targetMainView === 0
+          : observed.currentIds.length === expectedCurrentIds.length
+            && observed.currentIds.every(id => expectedCurrentIds.includes(id))
+        const summaryMatches = observed.summaryTargetMainView === undefined
+          || observed.summaryTargetMainView === observed.targetMainView
+        if (currentReleased && observed.retention.referenceCount === 0 && summaryMatches) {
+          finish(resolve)
+        }
+      } catch (error) {
+        finish(reject, error)
+      }
+    }
+    const onChange = () => {
+      // ObservableSnapshot implementations need not suppress a synchronous
+      // notification during subscribe; defer until both unsubscribe handles exist.
+      if (installing) return
+      check()
+    }
+
+    try {
+      if (typeof release.listSource?.subscribe !== 'function'
+        || typeof release.retentionSource?.subscribe !== 'function') {
+        throw localizedError(t, 'error.view-unavailable')
+      }
+      disposers.push(release.listSource.subscribe(onChange))
+      disposers.push(release.retentionSource.subscribe(onChange))
+      timer = setTimeout(() => finish(reject, localizedError(t, 'error.view-release')), SESSION_RELEASE_WAIT_MS)
+      installing = false
+      // The list subscription covers selection changes globally, while this
+      // per-ID source observes every owner releasing the target generation.
+      // Re-read after subscribing so a release between initial inspection and subscribe
+      // cannot be missed.
+      check()
+    } catch (error) {
+      installing = false
+      finish(reject, error)
+    }
+  })
+}
+
 async function moveSessionSafely(ctx, t, state, workspaceId, position, afterCommit) {
   const model = workspaceDialogModel(state)
   if (!model.canMove) throw localizedError(t, `reason.${model.reason ?? 'unsupported'}`)
@@ -254,11 +383,17 @@ async function moveSessionSafely(ctx, t, state, workspaceId, position, afterComm
   if (release.wasCurrent) {
     try {
       release.uiWorkspace.clearMain()
+      await waitForSessionReferencesToDrain(release, t, undefined)
       const afterRelease = readMainViewState(ctx, state.sessionId, t)
-      if (afterRelease.currentSessionId !== undefined || afterRelease.retention.referenceCount !== 0) {
+      if (afterRelease.currentSessionId !== undefined) {
+        if (afterRelease.currentSessionId !== state.sessionId) throw userNavigatedError(t)
+        throw localizedError(t, 'error.view-release')
+      }
+      if (afterRelease.retention.referenceCount !== 0) {
         throw localizedError(t, 'error.view-release')
       }
     } catch (error) {
+      if (error?.userNavigated === true) throw error
       const restoreError = restoreMainSessionIfVacant(ctx, release, t)
       if (restoreError !== undefined) {
         throw localizedError(t, 'error.view-release-restore', {
@@ -268,6 +403,14 @@ async function moveSessionSafely(ctx, t, state, workspaceId, position, afterComm
       }
       throw error
     }
+  } else if (release.retention.referenceCount !== 0) {
+    await waitForSessionReferencesToDrain(release, t, release.expectedCurrentSessionId)
+  }
+
+  if (!release.wasCurrent) {
+    const beforeMove = readMainViewState(ctx, state.sessionId, t)
+    if (beforeMove.currentSessionId !== release.expectedCurrentSessionId) throw userNavigatedError(t)
+    if (beforeMove.retention.referenceCount !== 0) throw localizedError(t, 'error.view-release')
   }
 
   let result
