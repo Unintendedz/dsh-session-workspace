@@ -1,4 +1,5 @@
 import React from 'react'
+import { IconFolderOpenOutlineRegular, MenuItemButton } from '@deepseek-ai/dsh-client-ui-primitives'
 
 const NS = 'dsh-session-workspace'
 const STYLE_ID = 'dsh-session-workspace-style'
@@ -660,21 +661,18 @@ async function loadAndOpenDialog(ctx, anchor, sessionId, t) {
   }
 }
 
-function MoveSessionMenuItem({ sessionId, displayTitle, useMenuOpenState, moveSession, t }) {
+function MoveSessionMenuItem({ sessionId, useMenuOpenState, moveSession, t }) {
   const [, setMenuOpen] = useMenuOpenState()
-  return React.createElement('button', {
-    type: 'button',
-    role: 'menuitem',
-    className: 'dsw-menu-item',
-    title: displayTitle,
-    onClick: (event) => {
+  return React.createElement(MenuItemButton, {
+    icon: React.createElement(IconFolderOpenOutlineRegular),
+    separatorBefore: true,
+    onSelect: (event) => {
       event.preventDefault()
       event.stopPropagation()
       setMenuOpen(false)
       void moveSession(sessionId, event.currentTarget)
     },
-  }, React.createElement('span', { className: 'dsw-menu-icon', 'aria-hidden': 'true' }, '↗'),
-  React.createElement('span', undefined, t('menu.move')))
+  }, t('menu.move'))
 }
 
 function registerSessionMenu(ctx, t) {
@@ -1402,7 +1400,6 @@ function installStyles() {
   style.id = STYLE_ID
   style.textContent = `
 .dsw-overlay{position:fixed;inset:0;z-index:1300;display:flex;align-items:center;justify-content:center;padding:20px;background:rgba(0,0,0,.48)}
-.dsw-menu-item{box-sizing:border-box;width:100%;min-height:32px;display:flex;align-items:center;gap:8px;padding:6px 10px;border:0;border-radius:6px;color:var(--dsw-alias-label-primary);background:transparent;text-align:left;font:inherit;cursor:pointer}.dsw-menu-item:hover{background:var(--dsw-alias-interactive-bg-hover)}.dsw-menu-item:focus-visible{outline:2px solid var(--dsw-alias-state-business-primary);outline-offset:-2px}.dsw-menu-icon{width:16px;flex:none;text-align:center}
 [data-dsw-drop-target="true"]{outline:2px solid var(--dsw-alias-state-business-primary);outline-offset:1px;background:var(--dsw-alias-interactive-bg-hover)}
 [role="tree"][data-dsw-cross-workspace-drop-active="true"] [data-row-key^="session:"]::before,[role="tree"][data-dsw-cross-workspace-drop-active="true"] [data-row-key^="session:"]::after{content:none!important;display:none!important}
 .dsw-session-drop-marker{box-sizing:border-box;position:fixed;z-index:1290;height:12px;pointer-events:none;background:linear-gradient(55deg,transparent calc(50% - 1px),var(--dsw-alias-state-business-primary) calc(50% - 1px) calc(50% + 1px),transparent calc(50% + 1px)) 0 0/5px 7px no-repeat,linear-gradient(125deg,transparent calc(50% - 1px),var(--dsw-alias-state-business-primary) calc(50% - 1px) calc(50% + 1px),transparent calc(50% + 1px)) 0 5px/5px 7px no-repeat,linear-gradient(var(--dsw-alias-state-business-primary) 0 0) 4px 5px/calc(100% - 4px) 2px no-repeat}

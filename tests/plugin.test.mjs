@@ -5,7 +5,9 @@ import { pathToFileURL } from 'node:url'
 import { readFile } from 'node:fs/promises'
 
 import { createRpcHandler, sessionWorkspaceState } from '../src/index.js'
-import { sessionIdFromElement, workspaceDialogModel } from '../src/client.js'
+import { loadClient } from './client-harness.mjs'
+
+const { exports: { sessionIdFromElement, workspaceDialogModel } } = await loadClient()
 
 function context({ active = false, positioned = false } = {}) {
   const oldWorkspace = {

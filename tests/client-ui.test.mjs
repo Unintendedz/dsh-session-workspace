@@ -2,7 +2,9 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { JSDOM } from 'jsdom'
 
-import { apply } from '../src/client.js'
+import { loadClient, uiPrimitives } from './client-harness.mjs'
+
+const { exports: { apply } } = await loadClient()
 
 const state = (overrides = {}) => ({
   sessionId: 'session-one',
@@ -495,7 +497,7 @@ async function openMenuDialog(app, sessionId = 'session-one') {
   })
   const anchor = document.createElement('button')
   document.body.append(anchor)
-  button.props.onClick({
+  button.props.onSelect({
     preventDefault() {},
     stopPropagation() {},
     currentTarget: anchor,
@@ -523,7 +525,10 @@ test('the official session menu slot opens the workspace chooser and moves the s
   })
   const anchor = document.createElement('button')
   document.body.append(anchor)
-  button.props.onClick({
+  assert.equal(button.type, uiPrimitives.MenuItemButton)
+  assert.equal(button.props.icon.type, uiPrimitives.IconFolderOpenOutlineRegular)
+  assert.equal(button.props.separatorBefore, true)
+  button.props.onSelect({
     preventDefault() {},
     stopPropagation() {},
     currentTarget: anchor,

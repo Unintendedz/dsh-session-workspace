@@ -22,7 +22,7 @@ await build({
   outfile: 'lib/client.js',
   absWorkingDir: fileURLToPath(new URL('..', import.meta.url)),
   bundle: true,
-  external: ['react'],
+  external: ['react', '@deepseek-ai/dsh-client-ui-primitives'],
   format: 'cjs',
   platform: 'browser',
   target: 'es2022',
