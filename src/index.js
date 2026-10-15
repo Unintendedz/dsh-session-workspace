@@ -1,4 +1,5 @@
 import { moveSessionWorkspace, supportsNativeWorkspaceMove, WorkspaceMoveError } from './migration.js'
+import { inspectLiveSession } from './live-session.js'
 
 export const name = 'dsh-session-workspace'
 export const inject = ['connection', 'webServer', 'agents', 'sessions', 'sessionPersistence', 'workspaceRegistry']
@@ -22,14 +23,19 @@ export async function sessionWorkspaceState(ctx, payload) {
   }
   const workspaces = ctx.workspaceRegistry.list()
   const current = workspaces.find(workspace => workspace.sessionIds.includes(sessionId))
+  const supported = (supportsNativeWorkspaceMove(ctx.sessionPersistence)
+    || (ctx.sessionPersistence.supportsRawArtifacts === true && typeof ctx.sessionPersistence.readRaw === 'function'))
+    && typeof ctx.workspaceRegistry.replaceHeaderIndex === 'function'
+  const liveState = await inspectLiveSession(ctx, sessionId)
   return {
     sessionId,
     currentWorkspaceId: current?.id,
     currentPath: header.cwd,
     active: live !== undefined || ctx.agents.get(sessionId) !== undefined,
-    supported: (supportsNativeWorkspaceMove(ctx.sessionPersistence)
-      || (ctx.sessionPersistence.supportsRawArtifacts && typeof ctx.sessionPersistence.readRaw === 'function'))
-      && typeof ctx.workspaceRegistry.replaceHeaderIndex === 'function',
+    busy: liveState.busy,
+    warmMoveSupported: supported && liveState.canRelease,
+    supported,
+    positionSupported: supported && workspaces.every(workspace => typeof workspace.insertSessionBefore === 'function'),
     workspaces: workspaces.map(workspace => ({
       workspaceId: workspace.id,
       title: workspace.title,
@@ -56,6 +62,7 @@ export function createRpcHandler(ctx) {
         error: {
           code: error instanceof WorkspaceMoveError ? error.code : 'internal',
           message: error instanceof Error ? error.message : String(error),
+          details: {},
         },
       }
     }

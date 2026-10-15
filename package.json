@@ -1,8 +1,8 @@
 {
   "name": "dsh-session-workspace",
-  "version": "0.2.0",
-  "description": "Move cold DeepSeek Harness sessions between registered workspaces",
-  "main": "src/index.js",
+  "version": "0.2.7",
+  "description": "Move idle DeepSeek Harness sessions between registered workspaces",
+  "main": "lib/host-0.2.7.mjs",
   "scripts": {
     "test": "npm run build && node --test tests/*.test.mjs && node --check src/index.js && node --check src/client.js",
     "build": "node scripts/build-client.mjs"
@@ -18,7 +18,7 @@
   "license": "MIT",
   "type": "module",
   "exports": {
-    ".": "./src/index.js",
+    ".": "./lib/host-0.2.7.mjs",
     "./client": "./lib/client.js",
     "./package.json": "./package.json"
   },
@@ -38,7 +38,9 @@
       "platform": "web",
       "inject": [
         "@deepseek-ai/dsh-client-locale",
-        "@deepseek-ai/dsh-client-connection"
+        "@deepseek-ai/dsh-client-connection",
+        "@deepseek-ai/dsh-client-ui-renderer",
+        "@deepseek-ai/dsh-client-ui-workspace"
       ]
     }
   },
@@ -51,6 +53,17 @@
     "url": "https://github.com/Unintendedz/dsh-session-workspace/issues"
   },
   "devDependencies": {
-    "esbuild": "^0.28.2"
+    "esbuild": "^0.28.2",
+    "react": "^18.3.1",
+    "jsdom": "26.1.0",
+    "@deepseek-ai/dsh-session-format-catalog": "0.2.0-rc.2"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-session-format-catalog": "0.2.0-rc.2"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/dsh-session-format-catalog": {
+      "optional": true
+    }
   }
 }

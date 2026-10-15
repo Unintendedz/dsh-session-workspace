@@ -4,11 +4,12 @@ English | [中文](./README.zh.md)
 
 Move an existing DeepSeek Harness session to another registered workspace without changing its session ID or conversation history.
 
-The plugin adds **Move to another workspace** to each session's sidebar menu. It changes the session's persisted `cwd`, moves its current JSONL generation, refreshes DSH's workspace index, and updates the workspace account. Older generation files are retained in the backup outside the indexed session root.
+Use either **Move to another workspace** in the session's sidebar menu or drag the session row into another workspace's sidebar group. The destination includes its folder/title row, session rows and the blank area inside that group. Both entry points use the same authenticated migration handler. The session ID and complete event history are retained; the persisted `cwd` and workspace account change. Older generation files are retained in the backup outside the indexed session root.
 
 ## Safety
 
-- Only cold sessions can move. If the session is open or running, switch to another session and try again after it closes.
+- DSH `0.2.0-rc.2` also supports opened idle sessions: fence new input to that Agent, await its complete Native teardown, move, then resume the same ID. Running, maintenance and queued-input states are refused without cancelling their work.
+- Releasing loaded sessions uses an adapter for this exact version. The Host version, lifecycle label and Agent scope metadata identity must match uniquely; unknown interfaces or ownership are refused. Other versions still require a cold session.
 - The destination must be an existing workspace registered in DSH.
 - Existing destination artifacts are never overwritten.
 - The source revision is checked before commit. A session that changes during preparation is rejected.
@@ -18,30 +19,48 @@ The plugin adds **Move to another workspace** to each session's sidebar menu. It
 
 ## Requirements
 
-- DeepSeek Harness `0.1.5-rc.1` for plugin `0.2.0`. Keep plugin `0.1.1` with DSH `0.1.1-rc.2`.
+- DeepSeek Harness `0.2.0-rc.2` for the V4 backend and both sidebar entry points. Its first-party `@deepseek-ai/dsh-session-format-catalog` validates the complete prepared artifact. The existing V3 native backend and bounded `0.1.5` menu fallback are retained.
+- The published `v0.2.0` tag targets DSH `0.1.5-rc.1`; use a checkout containing the V4 changes for DSH `0.2.0-rc.2`. Keep plugin `0.1.1` with DSH `0.1.1-rc.2`.
 - The default per-session JSONL persistence backend (`.jsonl.zstd` or `.jsonl`). Shared SQLite session persistence is rejected because it does not expose an independent artifact that can be re-homed safely.
 - Node.js with the Zstandard APIs used by DSH (the DSH-supported Node runtime already provides them).
 
 ## Install
 
+Build and install the checked-out version:
+
 ```sh
-dsh plugin --profile web add github:Unintendedz/dsh-session-workspace#v0.2.0
+npm ci
+npm run build
+npm pack
+dsh plugin --profile web add ./dsh-session-workspace-0.2.7.tgz
 ```
+
+Use `--profile desktop` instead of `--profile web` for the official desktop app.
 
 Restart the DSH web process after installation. The package's `cordis.patch.yml` mounts both the trusted-host RPC handler and the browser client.
 
 ## Update
 
-Install the pinned tag above and restart the DSH Web process. Version `0.2.0` uses native session handles, V3 snapshot headers, and the DSH 0.1.5 JSONL generation and write-lease hooks. Compressed artifacts are decoded across all frames. The complete prepared artifact is validated before publication; authentication and trusted-host checks remain owned by DSH. Future storage versions require a compatibility check.
+Turn off the entire `dsh-session-workspace` bundle on its plugin detail page, wait for its component to stop, install the new archive, then turn the bundle back on. DSH `0.2.0-rc.2` caches Host modules at the same URL. Each archive has a versioned Host entry containing all migration code, so unloading and remounting this bundle loads the new code without restarting other services. Replacing package files or refreshing inventory alone does not prove that the Host updated. Positioned drops also check the server capability and request a plugin reload before migrating when the Host is older.
+
+The native path supports V3 and V4 JSONL generation and write-lease hooks. V4 uses the first-party format catalog because DSH no longer exposes `createRestore` on the persistence backend. Compressed artifacts are decoded across all frames. The complete prepared artifact is validated before publication; authentication and trusted-host checks remain owned by DSH. Future storage versions require a compatibility check.
 
 ## Use
 
-1. Switch away from the session you want to move so it is no longer active.
-2. Open that session's sidebar menu.
-3. Select **Move to another workspace**.
-4. Choose the destination and confirm.
+1. Wait until the session is idle with no queued input. Opened sessions in DSH `0.2.0-rc.2` do not require an app restart. If the session is currently displayed, its view is temporarily released and reopened at the same ID afterward so the conversation can continue. If you select another session during the move, the plugin leaves your selection in place. An unverifiable or retained view is refused before migration.
+2. Use either entry point:
+   - **Menu:** open that session's **⋯** menu, select **Move to another workspace**, choose the destination and confirm.
+   - **Drag:** in a workspace-grouped sidebar, drag the session row onto the destination group's folder/title, a session row or blank area within the group. Over a session row, its upper/lower half selects insertion before/after that session; the destination blue line shows the exact position. Wait for the highlight and line, then release. Header and blank-area drops use the default position. A result or refusal is shown in a toast.
+
+While a valid destination workspace is highlighted, stale native session-reorder lines are hidden. The plugin draws its own destination insertion line outside the sidebar tree so that the source override does not hide it. Leaving the target or ending the drag restores the native indicators. Same-workspace session reordering and dragging workspace groups remain native DSH actions. Flat-list mode has no workspace drop targets; use the menu there.
+
+Positioned drops save the relative anchor through the public workspace ordering API and save the complete display order through DSH's existing shared sidebar Store action. This switches to native manual ordering and retains hidden/archived members and other accounts' order. New/blank and pinned sections retain DSH's fixed layout; an impossible section boundary is rejected before migration. Session IDs, history, pin and archive flags are preserved.
+
+When a move finishes, its insertion is merged into the latest sidebar order. Reorders and other moves completed while it was waiting are preserved, including concurrent moves in opposite directions while membership updates are still arriving. The retained `0.1.5` menu path moves only cold, non-current sessions and refreshes the list without selecting or clearing a session.
 
 The session remains at the same ID and appears under the destination workspace. Future shell, filesystem, and sandbox operations use the destination workspace path.
+
+The Host has no public single-session close API. The loaded-session adapter invokes only the exact Native `agentLoop.lifecycle(id)` teardown, rather than deleting registry entries or disposing the scope fiber itself. It waits for writer closure and verifies that the Native write lease can be acquired again. The client's `clearMain()` is also an internal compatibility seam for this version. The client subscribes to Native retention updates and waits up to two seconds for all references to the displayed session to be released, so a fresh history generation can be created. Remaining references or a new user selection stop the move; the plugin does not force other views to close. The public `openSession()` reopens the original ID. For a background session, the catalog is refreshed to restore its moved ID before public `sessions.using()` loads its Native title projection, followed by a final list refresh. This does not select the session or request a model response; changing cwd invalidates the old projection cache. Neither internal seam is a stable API for future DSH versions.
 
 ## Uninstall
 
@@ -56,7 +75,13 @@ npm test
 npm pack --dry-run
 ```
 
-Set `DSH_NATIVE_ROOT` to a DSH package root containing its `node_modules` to include native V3 persistence, compressed migration, foreign-writer refusal, and complete rollback tests. Use a fresh temporary `DSH_HOME` and named test profile.
+Set `DSH_NATIVE_ROOT` to an installed DSH package root containing its `node_modules` to include native persistence and real durable workspace-registry tests:
+
+```sh
+DSH_NATIVE_ROOT=/path/to/installed/dsh node --expose-internals --test tests/*.test.mjs
+```
+
+Tests create their own temporary session/storage roots. The native registry cases recreate the entire service stack to check ID, full history, membership, pin/archive state and subsequent appends after restart. DOM tests exercise both entry points, same-workspace drag pass-through, concurrent-drop suppression, visible refusals, and disposal.
 
 The tests use real temporary files and Node's Zstandard codec. They cover successful moves, backups, active-session refusal, destination conflicts, revision races, rollback, RPC results, and sidebar session targeting.
 

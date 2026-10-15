@@ -40,7 +40,8 @@ async function exists(path) {
   }
 }
 
-async function fixture({ active = false, changeDuringRead = false, destinationExists = false, failTargetAttach = false } = {}) {
+async function fixture({ active = false, changeDuringRead = false, destinationExists = false, failTargetAttach = false,
+  failTargetInsert = false, sourceIds = [SESSION_ID], targetIds = [] } = {}) {
   const root = await mkdtemp(join(tmpdir(), 'dsh-session-workspace-'))
   const source = join(root, 'sessions', 'old-project', SESSION_ID, 'session.jsonl')
   const destination = join(root, 'sessions', 'new-project', SESSION_ID, 'session.jsonl')
@@ -53,6 +54,7 @@ async function fixture({ active = false, changeDuringRead = false, destinationEx
   }
 
   const locations = new Map([[OLD_PATH, source], [NEW_PATH, destination]])
+  const headers = new Map([[SESSION_ID, { id: SESSION_ID, cwd: OLD_PATH }]])
   const persistence = {
     supportsRawArtifacts: true,
     locate(meta) {
@@ -73,11 +75,13 @@ async function fixture({ active = false, changeDuringRead = false, destinationEx
     async list() {
       const path = await exists(destination) ? destination : source
       const content = await readFile(path, 'utf8')
-      return [JSON.parse(content.slice(0, content.indexOf('\n')))]
+      const movedHeader = JSON.parse(content.slice(0, content.indexOf('\n')))
+      return [...headers.values()].filter(header => header.id !== SESSION_ID).concat(movedHeader)
     },
   }
 
-  const headers = new Map([[SESSION_ID, { id: SESSION_ID, cwd: OLD_PATH }]])
+  for (const id of sourceIds) headers.set(id, { id, cwd: OLD_PATH })
+  for (const id of targetIds) headers.set(id, { id, cwd: NEW_PATH })
   const registry = {
     headers,
     workspaces: [],
@@ -88,7 +92,7 @@ async function fixture({ active = false, changeDuringRead = false, destinationEx
       for (const header of next) headers.set(header.id, header)
     },
   }
-  function workspace(id, path, ids, failAttach = false) {
+  function workspace(id, path, ids, failAttach = false, failInsert = false) {
     const account = [...ids]
     return {
       id,
@@ -103,14 +107,25 @@ async function fixture({ active = false, changeDuringRead = false, destinationEx
         if (header?.cwd !== path) throw new Error(`header cwd ${header?.cwd} does not match ${path}`)
         if (!account.includes(sessionId)) account.unshift(sessionId)
       },
+      async insertSessionBefore(sessionId, beforeSessionId) {
+        if (failInsert && sessionId === SESSION_ID) throw new Error('synthetic target position failure')
+        if (!account.includes(sessionId)) throw new Error(`session ${sessionId} is not accounted`)
+        if (beforeSessionId !== undefined && !account.includes(beforeSessionId)) {
+          throw new Error(`anchor ${beforeSessionId} is not accounted`)
+        }
+        if (beforeSessionId === sessionId) return
+        const without = account.filter(id => id !== sessionId)
+        const index = beforeSessionId === undefined ? without.length : without.indexOf(beforeSessionId)
+        account.splice(0, account.length, ...without.slice(0, index), sessionId, ...without.slice(index))
+      },
       async detachSession(sessionId) {
         const index = account.indexOf(sessionId)
         if (index !== -1) account.splice(index, 1)
       },
     }
   }
-  const oldWorkspace = workspace('old-workspace', OLD_PATH, [SESSION_ID])
-  const newWorkspace = workspace('new-workspace', NEW_PATH, [], failTargetAttach)
+  const oldWorkspace = workspace('old-workspace', OLD_PATH, sourceIds)
+  const newWorkspace = workspace('new-workspace', NEW_PATH, targetIds, failTargetAttach, failTargetInsert)
   registry.workspaces.push(oldWorkspace, newWorkspace)
 
   return {
@@ -178,6 +193,56 @@ test('moveSessionWorkspace atomically moves a cold session and keeps a backup', 
   })
 })
 
+for (const { side, anchorSessionId, expected } of [
+  { side: 'before', anchorSessionId: 'target-middle', expected: ['target-first', SESSION_ID, 'target-middle', 'target-last'] },
+  { side: 'after', anchorSessionId: 'target-middle', expected: ['target-first', 'target-middle', SESSION_ID, 'target-last'] },
+  { side: 'after', anchorSessionId: 'target-last', expected: ['target-first', 'target-middle', 'target-last', SESSION_ID] },
+]) test(`moveSessionWorkspace persists a positioned insertion ${side} ${anchorSessionId}`, async () => {
+  const f = await fixture({ targetIds: ['target-first', 'target-middle', 'target-last'] })
+  await moveSessionWorkspace(f.ctx, {
+    sessionId: SESSION_ID,
+    workspaceId: 'new-workspace',
+    position: { anchorSessionId, side },
+  }, { backupRoot: f.backupRoot })
+  assert.deepEqual(f.newWorkspace.sessionIds, expected)
+})
+
+test('moveSessionWorkspace rejects a non-member position anchor before touching the source', async () => {
+  const f = await fixture({ targetIds: ['target-first', 'target-middle', 'target-last'] })
+  const original = await readFile(f.source)
+  await assert.rejects(moveSessionWorkspace(f.ctx, {
+    sessionId: SESSION_ID,
+    workspaceId: 'new-workspace',
+    position: { anchorSessionId: 'missing-anchor', side: 'before' },
+  }, { backupRoot: f.backupRoot }), error => error.code === 'workspace-anchor-not-found')
+  assert.deepEqual(await readFile(f.source), original)
+  assert.equal(await exists(f.destination), false)
+  assert.deepEqual(f.oldWorkspace.sessionIds, [SESSION_ID])
+  assert.deepEqual(f.newWorkspace.sessionIds, ['target-first', 'target-middle', 'target-last'])
+  assert.equal(await exists(f.backupRoot), false)
+})
+
+test('moveSessionWorkspace validates the exact position payload shape', async () => {
+  const f = await fixture({ targetIds: ['target-first', 'target-middle', 'target-last'] })
+  const original = await readFile(f.source)
+  for (const position of [
+    null,
+    {},
+    { anchorSessionId: 'target-middle' },
+    { anchorSessionId: 'target-middle', side: 'start' },
+    { anchorSessionId: 'target-middle', side: 'before', extra: true },
+  ]) {
+    await assert.rejects(moveSessionWorkspace(f.ctx, {
+      sessionId: SESSION_ID,
+      workspaceId: 'new-workspace',
+      position,
+    }, { backupRoot: f.backupRoot }), error => error.code === 'bad-request')
+  }
+  assert.deepEqual(await readFile(f.source), original)
+  assert.equal(await exists(f.destination), false)
+  assert.equal(await exists(f.backupRoot), false)
+})
+
 test('moveSessionWorkspace refuses a live session without touching its artifact', async () => {
   const f = await fixture({ active: true })
   const before = await stat(f.source)
@@ -223,4 +288,20 @@ test('moveSessionWorkspace restores the artifact and account when workspace atta
   assert.equal(await exists(f.destination), false)
   assert.deepEqual(f.oldWorkspace.sessionIds, [SESSION_ID])
   assert.deepEqual(f.newWorkspace.sessionIds, [])
+})
+
+test('moveSessionWorkspace restores source and target ordering when target position persistence fails', async () => {
+  const sourceIds = ['source-before', SESSION_ID, 'source-after']
+  const targetIds = ['target-first', 'target-middle', 'target-last']
+  const f = await fixture({ sourceIds, targetIds, failTargetInsert: true })
+  const original = await readFile(f.source)
+  await assert.rejects(moveSessionWorkspace(f.ctx, {
+    sessionId: SESSION_ID,
+    workspaceId: 'new-workspace',
+    position: { anchorSessionId: 'target-middle', side: 'after' },
+  }, { backupRoot: f.backupRoot }), /synthetic target position failure/)
+  assert.deepEqual(await readFile(f.source), original)
+  assert.equal(await exists(f.destination), false)
+  assert.deepEqual(f.oldWorkspace.sessionIds, sourceIds)
+  assert.deepEqual(f.newWorkspace.sessionIds, targetIds)
 })

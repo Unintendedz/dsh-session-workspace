@@ -1,15 +1,24 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
+import { join } from 'node:path'
+import { pathToFileURL } from 'node:url'
+import { readFile } from 'node:fs/promises'
 
 import { createRpcHandler, sessionWorkspaceState } from '../src/index.js'
-import { sessionIdFromElement, workspaceDialogModel } from '../src/client.js'
+import { loadClient } from './client-harness.mjs'
 
-function context({ active = false } = {}) {
+const { exports: { sessionIdFromElement, workspaceDialogModel } } = await loadClient()
+
+function context({ active = false, positioned = false } = {}) {
   const oldWorkspace = {
     id: 'old', path: '/projects/old', title: 'Old', sessionIds: ['session-one'],
   }
   const newWorkspace = {
     id: 'new', path: '/projects/new', title: 'New', sessionIds: [],
+  }
+  if (positioned) {
+    oldWorkspace.insertSessionBefore = () => {}
+    newWorkspace.insertSessionBefore = () => {}
   }
   return {
     sessions: {
@@ -37,7 +46,10 @@ test('sessionWorkspaceState reports the current workspace and active safety gate
     currentWorkspaceId: 'old',
     currentPath: '/projects/old',
     active: true,
+    busy: false,
+    warmMoveSupported: false,
     supported: true,
+    positionSupported: false,
     workspaces: [
       { workspaceId: 'old', title: 'Old', path: '/projects/old' },
       { workspaceId: 'new', title: 'New', path: '/projects/new' },
@@ -45,15 +57,64 @@ test('sessionWorkspaceState reports the current workspace and active safety gate
   })
 })
 
+test('workspace state advertises positional moves only with native account insertion support', async () => {
+  assert.equal((await sessionWorkspaceState(context({ positioned: true }), { sessionId: 'session-one' })).positionSupported, true)
+  assert.equal((await sessionWorkspaceState(context(), { sessionId: 'session-one' })).positionSupported, false)
+})
+
+test('versioned Host entry includes current migration code and the positional capability', async () => {
+  const pkg = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8'))
+  const hostPath = `lib/host-${pkg.version}.mjs`
+  assert.equal(pkg.main, hostPath)
+  assert.equal(pkg.exports['.'], `./${hostPath}`)
+  assert.ok((await readFile(new URL('../cordis.patch.yml', import.meta.url), 'utf8')).includes(`name: ./${hostPath}`))
+  const host = await import(new URL(`../${hostPath}`, import.meta.url))
+  const ctx = context({ positioned: true })
+  assert.equal((await host.sessionWorkspaceState(ctx, { sessionId: 'session-one' })).positionSupported, true)
+  const result = await host.createRpcHandler(ctx)('move', {
+    sessionId: 'session-one', workspaceId: 'new',
+    position: { anchorSessionId: 'missing-anchor', side: 'before' },
+  })
+  assert.equal(result.ok, false)
+  assert.equal(result.error.code, 'workspace-anchor-not-found')
+  assert.deepEqual(result.error.details, {})
+})
+
 test('RPC handler returns stable business errors', async () => {
   const rpc = createRpcHandler(context())
   assert.deepEqual(await rpc('unknown', {}), {
     ok: false,
-    error: { code: 'bad-request', message: 'unknown dsh-session-workspace endpoint "unknown"' },
+    error: {
+      code: 'bad-request',
+      message: 'unknown dsh-session-workspace endpoint "unknown"',
+      details: {},
+    },
   })
   const missing = await rpc('move', { sessionId: 'session-one', workspaceId: 'missing' })
   assert.equal(missing.ok, false)
   assert.equal(missing.error.code, 'workspace-not-found')
+})
+
+test('RPC business failures pass the installed DSH server-response wire schema', {
+  skip: !process.env.DSH_NATIVE_ROOT,
+}, async () => {
+  const sdkRoot = process.env.DSH_NATIVE_ROOT
+  const sdkModule = pathToFileURL(join(
+    sdkRoot,
+    'node_modules/@deepseek-ai/dsh-client-connection/lib/index.js',
+  )).href
+  const { serverResponseSchema } = await import(sdkModule)
+  const result = await createRpcHandler(context())('move', { sessionId: 'session-one' })
+  const response = {
+    type: 'server-response',
+    rpcId: 'rpc-session-workspace-invalid-payload',
+    result,
+  }
+
+  const parsed = serverResponseSchema.parse(response)
+  assert.equal(parsed.result.ok, false)
+  assert.equal(parsed.result.error.code, 'bad-request')
+  assert.equal(parsed.result.error.message, 'workspaceId must be a non-empty string')
 })
 
 test('workspaceDialogModel excludes the current workspace and gates active sessions', () => {
@@ -78,16 +139,12 @@ test('workspaceDialogModel excludes the current workspace and gates active sessi
   })
 })
 
-test('sessionIdFromElement follows the owning React fiber without reading row text', () => {
-  const element = {
-    '__reactFiber$test': {
-      memoizedProps: {},
-      return: {
-        memoizedProps: { node: { id: 'session-one' } },
-        return: null,
-      },
-    },
+test('sessionIdFromElement reads the public session row key instead of React internals', () => {
+  const row = {
+    getAttribute: name => name === 'data-row-key' ? 'session:session-one' : null,
   }
-  assert.equal(sessionIdFromElement(element), 'session-one')
+  const child = { closest: selector => selector === '[data-row-key^="session:"]' ? row : null }
+  assert.equal(sessionIdFromElement(child), 'session-one')
+  assert.equal(sessionIdFromElement({ dataset: { rowKey: 'workspace:workspace-one' } }), undefined)
   assert.equal(sessionIdFromElement({}), undefined)
 })
