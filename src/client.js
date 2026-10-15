@@ -655,7 +655,11 @@ async function loadAndOpenDialog(ctx, anchor, sessionId, t) {
   try {
     const result = await ctx.connection.rpc.call(RPC_PATH, 'state', { sessionId })
     if (!result?.ok) throw new Error(resultError(result))
-    openDialog(ctx, anchor, sessionId, result.value, t)
+    // Native Menu restores its persistent trigger in a post-selection microtask.
+    // Let that finish even when the RPC resolves immediately, then retain the
+    // current focus rather than a menu item that has just been unmounted.
+    await Promise.resolve()
+    openDialog(ctx, anchor?.isConnected ? anchor : document.activeElement, sessionId, result.value, t)
   } catch (error) {
     showToast(t('error.load', { message: error instanceof Error ? error.message : String(error) }), { error: true })
   }
@@ -666,11 +670,9 @@ function MoveSessionMenuItem({ sessionId, useMenuOpenState, moveSession, t }) {
   return React.createElement(MenuItemButton, {
     icon: React.createElement(IconFolderOpenOutlineRegular),
     separatorBefore: true,
-    onSelect: (event) => {
-      event.preventDefault()
-      event.stopPropagation()
+    onSelect: () => {
       setMenuOpen(false)
-      void moveSession(sessionId, event.currentTarget)
+      void moveSession(sessionId)
     },
   }, t('menu.move'))
 }

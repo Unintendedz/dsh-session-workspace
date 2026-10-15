@@ -497,11 +497,8 @@ async function openMenuDialog(app, sessionId = 'session-one') {
   })
   const anchor = document.createElement('button')
   document.body.append(anchor)
-  button.props.onSelect({
-    preventDefault() {},
-    stopPropagation() {},
-    currentTarget: anchor,
-  })
+  anchor.focus()
+  button.props.onSelect()
   await flush()
   return document.querySelector('[role="dialog"]')
 }
@@ -525,14 +522,11 @@ test('the official session menu slot opens the workspace chooser and moves the s
   })
   const anchor = document.createElement('button')
   document.body.append(anchor)
+  anchor.focus()
   assert.equal(button.type, uiPrimitives.MenuItemButton)
   assert.equal(button.props.icon.type, uiPrimitives.IconFolderOpenOutlineRegular)
   assert.equal(button.props.separatorBefore, true)
-  button.props.onSelect({
-    preventDefault() {},
-    stopPropagation() {},
-    currentTarget: anchor,
-  })
+  button.props.onSelect()
   await flush()
 
   assert.deepEqual(menuState, [false])
@@ -555,6 +549,19 @@ test('the official session menu slot opens the workspace chooser and moves the s
     payload: { sessionId: 'session-one', workspaceId: 'new' },
   })
   await new Promise(resolve => setTimeout(resolve, 750))
+  assert.equal(document.activeElement, anchor)
+})
+
+for (const closeWith of ['cancel', 'Escape']) test(`the menu dialog returns focus to the persistent trigger after ${closeWith}`, async (t) => {
+  const app = setup()
+  t.after(() => app.teardown())
+  const dialog = await openMenuDialog(app)
+  const trigger = document.querySelector('body > button')
+  assert.equal(document.activeElement, dialog.querySelector('select'))
+  if (closeWith === 'cancel') dialog.querySelector('.dsw-actions button').click()
+  else document.activeElement.dispatchEvent(new app.dom.window.KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }))
+  assert.equal(document.querySelector('[role="dialog"]'), null)
+  assert.equal(document.activeElement, trigger)
 })
 
 test('moving an opened idle main session from the menu releases and reopens the same ID', async (t) => {
